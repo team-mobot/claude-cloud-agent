@@ -157,10 +157,11 @@ Important instructions:
 1. You are working on branch: $BRANCH
 2. Repository: $REPO
 3. PR Number: $PR_NUMBER
-4. Make commits as you work - commit early and often
-5. Push your changes to the remote branch
-6. You can read PR comments with: gh pr view $PR_NUMBER --repo $REPO --comments
-7. When done, summarize what you accomplished
+4. Before starting work, check README.md for any development setup instructions (database, dependencies, etc.) and run them. You have sudo access to install any tools you need.
+5. Make commits as you work - commit early and often
+6. Push your changes to the remote branch
+7. You can read PR comments with: gh pr view $PR_NUMBER --repo $REPO --comments
+8. When done, summarize what you accomplished
 PROMPT_EOF
 
 # Add PR context for resumed sessions

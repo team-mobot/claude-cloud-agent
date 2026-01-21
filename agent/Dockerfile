@@ -11,6 +11,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     curl \
     git \
+    sudo \
     awscli \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
@@ -21,8 +22,9 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -u 1000 -s /bin/bash agent
+# Create non-root user with sudo access
+RUN useradd -m -u 1000 -s /bin/bash agent \
+    && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
