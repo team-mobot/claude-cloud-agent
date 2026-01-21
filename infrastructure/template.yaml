@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Claude Cloud Agent - Autonomous Development Agent Infrastructure'
+
+Parameters:
+  GitHubSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret containing GitHub App credentials (app_id, private_key, webhook_secret)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for ECS tasks
+
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets for agent tasks
+
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket containing Lambda deployment package
+
+  TriggerLabel:
+    Type: String
+    Default: 'claude-dev'
+    Description: GitHub label that triggers agent sessions
+
+Resources:
+
+  #############################################
+  # API Gateway + Lambda (Webhook Handler)
+  #############################################
+
+  WebhookApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: claude-cloud-agent-webhook
+      ProtocolType: HTTP
+
+  WebhookIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebhookApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt WebhookFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  WebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebhookApi
+      RouteKey: 'POST /webhook'
+      Target: !Sub 'integrations/${WebhookIntegration}'
+
+  WebhookStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebhookApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  WebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: claude-cloud-agent-webhook
+      Runtime: python3.11
+      Handler: handler.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt WebhookFunctionRole.Arn
+      Environment:
+        Variables:
+          GITHUB_SECRET_ARN: !Ref GitHubSecretArn
+          SESSION_TABLE: !Ref SessionTable
+          ECS_CLUSTER: !Ref AgentCluster
+          AGENT_TASK_DEFINITION: !Ref AgentTaskDefinition
+          SUBNETS: !Join [',', !Ref PublicSubnets]
+          SECURITY_GROUPS: !Ref AgentSecurityGroup
+          TRIGGER_LABEL: !Ref TriggerLabel
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: webhook/handler.zip
+
+  WebhookFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*'
+
+  WebhookFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ClaudeCloudAgentWebhook
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref GitHubSecretArn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt SessionTable.Arn
+                  - !Sub '${SessionTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                  - ecs:StopTask
+                  - ecs:DescribeTasks
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt AgentExecutionRole.Arn
+                  - !GetAtt AgentTaskRole.Arn
+
+  #############################################
+  # DynamoDB (Session State)
+  #############################################
+
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: claude-cloud-agent-sessions
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: pr_number
+          AttributeType: N
+      GlobalSecondaryIndexes:
+        - IndexName: pr-index
+          KeySchema:
+            - AttributeName: pr_number
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  #############################################
+  # ECS Cluster (Agent Tasks)
+  #############################################
+
+  AgentCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: claude-cloud-agent
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+
+  AgentTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: claude-cloud-agent
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '2048'
+      Memory: '4096'
+      ExecutionRoleArn: !GetAtt AgentExecutionRole.Arn
+      TaskRoleArn: !GetAtt AgentTaskRole.Arn
+      ContainerDefinitions:
+        - Name: claude-cloud-agent
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/claude-cloud-agent:latest'
+          Environment:
+            - Name: SESSION_TABLE
+              Value: !Ref SessionTable
+            - Name: GITHUB_SECRET_ARN
+              Value: !Ref GitHubSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AgentLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: agent
+
+  AgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/claude-cloud-agent
+      RetentionInDays: 14
+
+  AgentExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref GitHubSecretArn
+
+  AgentTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AgentPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref GitHubSecretArn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt SessionTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  AgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Claude Cloud Agent tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+Outputs:
+  WebhookUrl:
+    Description: URL to configure in GitHub App
+    Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/webhook'
+
+  SessionTableName:
+    Description: DynamoDB table for session state
+    Value: !Ref SessionTable
+
+  AgentClusterName:
+    Description: ECS cluster for agent tasks
+    Value: !Ref AgentCluster
