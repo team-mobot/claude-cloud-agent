@@ -3,6 +3,7 @@ FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 ENV UV_SYSTEM_PYTHON=1 \
     PYTHONUNBUFFERED=1 \
     CLAUDE_CODE_USE_BEDROCK=1 \
+    ANTHROPIC_MODEL=us.anthropic.claude-opus-4-5-20251101-v1:0 \
     AWS_DEFAULT_REGION=us-east-1
 
 WORKDIR /app
