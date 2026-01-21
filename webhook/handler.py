@@ -310,7 +310,7 @@ def start_agent_task(session_id: str, pr_number: int, branch: str,
             },
             overrides={
                 'containerOverrides': [{
-                    'name': 'claude-cloud-agent',
+                    'name': os.environ.get('CONTAINER_NAME', 'claude-cloud-agent'),
                     'environment': [
                         {'name': 'SESSION_ID', 'value': session_id},
                         {'name': 'PR_NUMBER', 'value': str(pr_number)},

@@ -157,7 +157,7 @@ Important instructions:
 1. You are working on branch: $BRANCH
 2. Repository: $REPO
 3. PR Number: $PR_NUMBER
-4. Before starting work, check README.md for any development setup instructions (database, dependencies, etc.) and run them. You have sudo access to install any tools you need.
+4. Before starting work, check README.md and CLAUDE.md for development setup instructions. You have sudo access - if prerequisites like PostgreSQL, Redis, or other services are required but not installed, install and start them (e.g., sudo apt-get update && sudo apt-get install -y postgresql && sudo service postgresql start). Set up any required databases, run migrations, etc.
 5. Make commits as you work - commit early and often
 6. Push your changes to the remote branch
 7. You can read PR comments with: gh pr view $PR_NUMBER --repo $REPO --comments
