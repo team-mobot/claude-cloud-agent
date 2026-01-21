@@ -6,6 +6,11 @@ Parameters:
     Type: String
     Description: ARN of Secrets Manager secret containing GitHub App credentials (app_id, private_key, webhook_secret)
 
+  JiraSecretArn:
+    Type: String
+    Default: ''
+    Description: ARN of Secrets Manager secret containing JIRA credentials (site, email, api_token, webhook_secret, repo_custom_field_id)
+
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: VPC for ECS tasks
@@ -21,7 +26,10 @@ Parameters:
   TriggerLabel:
     Type: String
     Default: 'claude-dev'
-    Description: GitHub label that triggers agent sessions
+    Description: Label that triggers agent sessions (used for both GitHub and JIRA)
+
+Conditions:
+  HasJiraSecret: !Not [!Equals [!Ref JiraSecretArn, '']]
 
 Resources:
 
@@ -69,6 +77,7 @@ Resources:
       Environment:
         Variables:
           GITHUB_SECRET_ARN: !Ref GitHubSecretArn
+          JIRA_SECRET_ARN: !If [HasJiraSecret, !Ref JiraSecretArn, '']
           SESSION_TABLE: !Ref SessionTable
           ECS_CLUSTER: !Ref AgentCluster
           AGENT_TASK_DEFINITION: !Ref AgentTaskDefinition
@@ -109,6 +118,7 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Ref GitHubSecretArn
+                  - !If [HasJiraSecret, !Ref JiraSecretArn, !Ref 'AWS::NoValue']
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -148,10 +158,18 @@ Resources:
           AttributeType: S
         - AttributeName: pr_number
           AttributeType: N
+        - AttributeName: jira_issue_key
+          AttributeType: S
       GlobalSecondaryIndexes:
         - IndexName: pr-index
           KeySchema:
             - AttributeName: pr_number
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: jira-issue-index
+          KeySchema:
+            - AttributeName: jira_issue_key
               KeyType: HASH
           Projection:
             ProjectionType: ALL
@@ -225,6 +243,7 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Ref GitHubSecretArn
+                  - !If [HasJiraSecret, !Ref JiraSecretArn, !Ref 'AWS::NoValue']
 
   AgentTaskRole:
     Type: AWS::IAM::Role
@@ -251,6 +270,7 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Ref GitHubSecretArn
+                  - !If [HasJiraSecret, !Ref JiraSecretArn, !Ref 'AWS::NoValue']
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -275,7 +295,7 @@ Resources:
 
 Outputs:
   WebhookUrl:
-    Description: URL to configure in GitHub App
+    Description: URL to configure in GitHub App and JIRA webhooks
     Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/webhook'
 
   SessionTableName:

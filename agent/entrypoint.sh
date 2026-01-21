@@ -3,12 +3,17 @@ set -e
 
 # Claude Cloud Agent Entrypoint
 # Runs as an ECS Fargate task to execute Claude Code on a GitHub PR
+# Supports both GitHub and JIRA as work sources
 
 echo "=== Claude Cloud Agent Starting ==="
 echo "Session ID: $SESSION_ID"
 echo "PR Number: $PR_NUMBER"
 echo "Branch: $BRANCH"
 echo "Repo: $REPO"
+echo "Source: ${SOURCE:-github}"
+if [ -n "$JIRA_ISSUE_KEY" ]; then
+    echo "JIRA Issue: $JIRA_ISSUE_KEY"
+fi
 
 # Validate required environment variables
 if [ -z "$SESSION_ID" ] || [ -z "$PR_NUMBER" ] || [ -z "$BRANCH" ] || [ -z "$REPO" ]; then
@@ -55,6 +60,22 @@ EOF
 export INSTALLATION_TOKEN
 export REPO
 export PR_NUMBER
+export SOURCE="${SOURCE:-github}"
+export JIRA_ISSUE_KEY="${JIRA_ISSUE_KEY:-}"
+export JIRA_SITE="${JIRA_SITE:-}"
+export JIRA_SECRET_ARN="${JIRA_SECRET_ARN:-}"
+
+# Get JIRA credentials if this is a JIRA-sourced session
+JIRA_EMAIL=""
+JIRA_API_TOKEN=""
+if [ "$SOURCE" = "jira" ] && [ -n "$JIRA_SECRET_ARN" ]; then
+    echo "Fetching JIRA credentials..."
+    JIRA_CREDS=$(aws secretsmanager get-secret-value --secret-id "$JIRA_SECRET_ARN" --query 'SecretString' --output text)
+    JIRA_EMAIL=$(echo "$JIRA_CREDS" | python3 -c "import sys, json; print(json.load(sys.stdin)['email'])")
+    JIRA_API_TOKEN=$(echo "$JIRA_CREDS" | python3 -c "import sys, json; print(json.load(sys.stdin)['api_token'])")
+    export JIRA_EMAIL
+    export JIRA_API_TOKEN
+fi
 
 # Configure git
 git config --global user.name "Claude Cloud Agent[bot]"
@@ -76,18 +97,24 @@ cd repo
 echo "Checking out branch: $BRANCH"
 git checkout "$BRANCH"
 
-# Post starting comment
+# Post starting comment to GitHub (and JIRA if applicable)
 echo "Posting start comment..."
-python3 << PYEOF
+python3 << 'PYEOF'
 import requests
 import os
 
+# GitHub posting
 token = os.environ['INSTALLATION_TOKEN']
 repo = os.environ['REPO']
 pr_number = os.environ['PR_NUMBER']
 is_resume = os.environ.get('RESUME', 'false') == 'true'
+source = os.environ.get('SOURCE', 'github')
+jira_issue_key = os.environ.get('JIRA_ISSUE_KEY', '')
+jira_site = os.environ.get('JIRA_SITE', '')
+jira_email = os.environ.get('JIRA_EMAIL', '')
+jira_api_token = os.environ.get('JIRA_API_TOKEN', '')
 
-headers = {
+gh_headers = {
     'Authorization': f'token {token}',
     'Accept': 'application/vnd.github+json'
 }
@@ -103,11 +130,41 @@ else:
 Starting Claude Code session...
 '''
 
+# Post to GitHub PR
 requests.post(
     f'https://api.github.com/repos/{repo}/issues/{pr_number}/comments',
-    headers=headers,
+    headers=gh_headers,
     json={'body': body}
 )
+
+# Post to JIRA if this is a JIRA-sourced session
+if source == 'jira' and jira_issue_key and jira_site and jira_email and jira_api_token:
+    jira_body = {
+        "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [
+                        {"type": "text", "text": body.replace('*', '')}
+                    ]
+                }
+            ]
+        }
+    }
+    try:
+        requests.post(
+            f'https://{jira_site}/rest/api/3/issue/{jira_issue_key}/comment',
+            auth=(jira_email, jira_api_token),
+            headers={
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            },
+            json=jira_body
+        )
+    except Exception as e:
+        print(f"Error posting to JIRA: {e}")
 PYEOF
 
 # Create the prompt file
@@ -164,6 +221,12 @@ Important instructions:
 8. When done, summarize what you accomplished
 PROMPT_EOF
 
+# Add JIRA context if applicable
+if [ "$SOURCE" = "jira" ] && [ -n "$JIRA_ISSUE_KEY" ]; then
+    echo "" >> /tmp/prompt.txt
+    echo "9. This task originated from JIRA issue $JIRA_ISSUE_KEY" >> /tmp/prompt.txt
+fi
+
 # Add PR context for resumed sessions
 if [ -n "$PR_CONTEXT" ]; then
     echo "" >> /tmp/prompt.txt
@@ -178,26 +241,74 @@ import os
 import json
 import time
 
+# GitHub config
 token = os.environ['INSTALLATION_TOKEN']
 repo = os.environ['REPO']
 pr_number = os.environ['PR_NUMBER']
 output_file = '/tmp/claude_output.txt'
 
-headers = {
+# JIRA config
+source = os.environ.get('SOURCE', 'github')
+jira_issue_key = os.environ.get('JIRA_ISSUE_KEY', '')
+jira_site = os.environ.get('JIRA_SITE', '')
+jira_email = os.environ.get('JIRA_EMAIL', '')
+jira_api_token = os.environ.get('JIRA_API_TOKEN', '')
+
+gh_headers = {
     'Authorization': f'token {token}',
     'Accept': 'application/vnd.github+json'
 }
 
-def post_comment(body):
-    """Post a comment to the PR."""
+def post_github_comment(body):
+    """Post a comment to the GitHub PR."""
     try:
         requests.post(
             f'https://api.github.com/repos/{repo}/issues/{pr_number}/comments',
-            headers=headers,
+            headers=gh_headers,
             json={'body': body}
         )
     except Exception as e:
-        print(f"Error posting comment: {e}")
+        print(f"Error posting GitHub comment: {e}")
+
+def post_jira_comment(body):
+    """Post a comment to the JIRA issue."""
+    if not (source == 'jira' and jira_issue_key and jira_site and jira_email and jira_api_token):
+        return
+
+    # Strip markdown formatting for JIRA (basic cleanup)
+    plain_body = body.replace('**', '').replace('`', "'")
+
+    jira_body = {
+        "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [
+                        {"type": "text", "text": plain_body[:30000]}  # JIRA comment limit
+                    ]
+                }
+            ]
+        }
+    }
+    try:
+        requests.post(
+            f'https://{jira_site}/rest/api/3/issue/{jira_issue_key}/comment',
+            auth=(jira_email, jira_api_token),
+            headers={
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            },
+            json=jira_body
+        )
+    except Exception as e:
+        print(f"Error posting JIRA comment: {e}")
+
+def post_comment(body):
+    """Post a comment to GitHub (always) and JIRA (if applicable)."""
+    post_github_comment(body)
+    post_jira_comment(body)
 
 def format_tool_use(tool_name, tool_input):
     """Format a tool use for display."""
@@ -334,17 +445,25 @@ kill $STREAMER_PID 2>/dev/null || true
 echo "Pushing final changes..."
 git push origin "$BRANCH" || true
 
-# Post completion comment
+# Post completion comment to GitHub (and JIRA if applicable)
 echo "Posting completion comment..."
 python3 << 'PYEOF'
 import requests
 import os
 
+# GitHub config
 token = os.environ['INSTALLATION_TOKEN']
 repo = os.environ['REPO']
 pr_number = os.environ['PR_NUMBER']
 
-headers = {
+# JIRA config
+source = os.environ.get('SOURCE', 'github')
+jira_issue_key = os.environ.get('JIRA_ISSUE_KEY', '')
+jira_site = os.environ.get('JIRA_SITE', '')
+jira_email = os.environ.get('JIRA_EMAIL', '')
+jira_api_token = os.environ.get('JIRA_API_TOKEN', '')
+
+gh_headers = {
     'Authorization': f'token {token}',
     'Accept': 'application/vnd.github+json'
 }
@@ -353,11 +472,41 @@ body = '''**Claude Cloud Agent Complete** ✅
 
 I've finished working on this task. Please review the changes and let me know if you need any modifications.'''
 
+# Post to GitHub PR
 requests.post(
     f'https://api.github.com/repos/{repo}/issues/{pr_number}/comments',
-    headers=headers,
+    headers=gh_headers,
     json={'body': body}
 )
+
+# Post to JIRA if this is a JIRA-sourced session
+if source == 'jira' and jira_issue_key and jira_site and jira_email and jira_api_token:
+    jira_body = {
+        "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [
+                        {"type": "text", "text": f"Claude Cloud Agent Complete\n\nI've finished working on this task. Please review the changes in the PR:\nhttps://github.com/{repo}/pull/{pr_number}"}
+                    ]
+                }
+            ]
+        }
+    }
+    try:
+        requests.post(
+            f'https://{jira_site}/rest/api/3/issue/{jira_issue_key}/comment',
+            auth=(jira_email, jira_api_token),
+            headers={
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            },
+            json=jira_body
+        )
+    except Exception as e:
+        print(f"Error posting to JIRA: {e}")
 PYEOF
 
 # Update DynamoDB session status
