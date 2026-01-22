@@ -242,7 +242,7 @@ Important instructions:
 2. Repository: $REPO
 3. PR Number: $PR_NUMBER
 4. Before starting work, check README.md and CLAUDE.md for development setup instructions. You have sudo access - if prerequisites like PostgreSQL, Redis, or other services are required but not installed, install and start them (e.g., sudo apt-get update && sudo apt-get install -y postgresql && sudo service postgresql start). Set up any required databases, run migrations, etc.
-5. **UAT SERVER REQUIRED**: After setup, start the dev server in the background on port ${DEV_SERVER_PORT:-3000} and keep it running throughout your session. Use the project's dev server command (npm run dev, python manage.py runserver, etc.) or a simple HTTP server. Run it with nohup or & to keep it running. The UAT URL http://${PUBLIC_IP:-localhost}:${DEV_SERVER_PORT:-3000} has been shared for testing.
+5. **UAT SERVER REQUIRED**: After setup, start the project's dev server in the background and keep it running throughout your session. Check package.json or the README for the correct command (e.g., npm run dev, yarn dev, python manage.py runserver). For Node/React projects, you may need to configure the port with --port ${DEV_SERVER_PORT:-3000} or via environment variable. Run it with nohup or & to keep it running. The UAT URL http://${PUBLIC_IP:-localhost}:${DEV_SERVER_PORT:-3000} has been shared for testing. IMPORTANT: Do NOT use a simple Python HTTP server for web apps - use the project's native dev server so the app renders correctly.
 6. Make commits as you work - commit early and often
 7. Push your changes to the remote branch
 8. You can read PR comments with: gh pr view $PR_NUMBER --repo $REPO --comments
