@@ -182,7 +182,7 @@ def handle_github_new_issue(issue: dict, repo: dict):
     issue_obj.edit(state='closed')
 
     # 6. Start agent task
-    start_agent_task(
+    task_info = start_agent_task(
         session_id=session_id,
         pr_number=pr.number,
         branch=branch_name,
@@ -190,6 +190,15 @@ def handle_github_new_issue(issue: dict, repo: dict):
         repo=repo['full_name'],
         source='github'
     )
+
+    # 7. Post UAT info to PR
+    if task_info:
+        pr.create_issue_comment(
+            f"**UAT Access**\n\n"
+            f"Connect to the running container:\n"
+            f"```bash\n{task_info['uat_command']}\n```\n\n"
+            f"*Requires AWS CLI and Session Manager plugin*"
+        )
 
     return {'statusCode': 200, 'body': f'Started session {session_id}'}
 
@@ -202,9 +211,21 @@ def handle_github_comment(body: dict):
 
     pr_number = body['issue']['number']
     comment = body['comment']
+    comment_text = comment.get('body', '')
 
-    # Skip bot's own comments
-    if comment['user']['login'].endswith('[bot]'):
+    # Skip bot's own comments - check username and content signatures
+    is_bot_comment = (
+        comment['user']['login'].endswith('[bot]') or
+        '**Claude Cloud Agent' in comment_text or
+        '💬 **Claude:**' in comment_text or
+        '📖 **Reading file:**' in comment_text or
+        '💻 **Running:**' in comment_text or
+        '✅ **Result:**' in comment_text or
+        '❌ **Error:**' in comment_text or
+        '**UAT Access**' in comment_text
+    )
+
+    if is_bot_comment:
         return {'statusCode': 200, 'body': 'Bot comment, ignoring'}
 
     # Find session
@@ -218,6 +239,11 @@ def handle_github_comment(body: dict):
         return {'statusCode': 200, 'body': 'No session found'}
 
     session = response['Items'][0]
+
+    # Skip if session is already running (prevent duplicate tasks)
+    if session.get('status') == 'running':
+        print(f"Session {session['session_id']} already running, skipping")
+        return {'statusCode': 200, 'body': 'Session already running'}
 
     # Resume agent with user's comment as new instruction
     start_agent_task(
@@ -577,20 +603,8 @@ def handle_jira_labeled(issue: dict, webhook_data: dict):
         'created_at': datetime.utcnow().isoformat()
     })
 
-    # 5. Post comment to JIRA with PR link
-    post_jira_comment(
-        jira_creds,
-        issue_key,
-        f"**Claude Cloud Agent Started**\n\n"
-        f"Development session started! Working in GitHub:\n\n"
-        f"- Repository: {target_repo}\n"
-        f"- Branch: {branch_name}\n"
-        f"- Pull Request: https://github.com/{target_repo}/pull/{pr.number}\n\n"
-        f"Progress updates will be posted here and on the PR."
-    )
-
-    # 6. Start agent task
-    start_agent_task(
+    # 5. Start agent task
+    task_info = start_agent_task(
         session_id=session_id,
         pr_number=pr.number,
         branch=branch_name,
@@ -600,6 +614,36 @@ def handle_jira_labeled(issue: dict, webhook_data: dict):
         jira_issue_key=issue_key,
         jira_site=jira_site
     )
+
+    # 6. Post comment to JIRA with PR link and UAT info
+    uat_info = ""
+    if task_info:
+        uat_info = (
+            f"\n\n**UAT Access**\n"
+            f"Connect to the running container:\n"
+            f"```\n{task_info['uat_command']}\n```"
+        )
+
+    post_jira_comment(
+        jira_creds,
+        issue_key,
+        f"**Claude Cloud Agent Started**\n\n"
+        f"Development session started! Working in GitHub:\n\n"
+        f"- Repository: {target_repo}\n"
+        f"- Branch: {branch_name}\n"
+        f"- Pull Request: https://github.com/{target_repo}/pull/{pr.number}\n\n"
+        f"Progress updates will be posted here and on the PR."
+        f"{uat_info}"
+    )
+
+    # Also post UAT info to GitHub PR
+    if task_info:
+        pr.create_issue_comment(
+            f"**UAT Access**\n\n"
+            f"Connect to the running container:\n"
+            f"```bash\n{task_info['uat_command']}\n```\n\n"
+            f"*Requires AWS CLI and Session Manager plugin*"
+        )
 
     return {'statusCode': 200, 'body': f'Started session {session_id}'}
 
@@ -616,7 +660,25 @@ def handle_jira_comment(webhook_data: dict):
 
     # Skip bot's own comments (check for automation user or specific text)
     author = comment.get('author', {})
-    if author.get('accountType') == 'app' or 'Claude Cloud Agent' in comment.get('body', ''):
+
+    # Extract text from ADF body for bot detection
+    comment_body_raw = comment.get('body', '')
+    if isinstance(comment_body_raw, dict):
+        comment_text = extract_text_from_adf(comment_body_raw)
+    else:
+        comment_text = str(comment_body_raw)
+
+    # Skip if posted by app or contains bot signatures
+    is_bot_comment = (
+        author.get('accountType') == 'app' or
+        'Claude Cloud Agent' in comment_text or
+        '🤖' in comment_text or  # Bot emoji used in start message
+        '💬 **Claude:**' in comment_text or  # Claude response format
+        comment_text.startswith('Claude Cloud Agent')
+    )
+
+    if is_bot_comment:
+        print(f"Skipping bot comment on {issue_key}")
         return {'statusCode': 200, 'body': 'Bot comment, ignoring'}
 
     # Find session by JIRA issue key
@@ -630,6 +692,11 @@ def handle_jira_comment(webhook_data: dict):
         return {'statusCode': 200, 'body': 'No session found for this JIRA issue'}
 
     session = response['Items'][0]
+
+    # Skip if session is already running (prevent duplicate tasks)
+    if session.get('status') == 'running':
+        print(f"Session {session['session_id']} already running, skipping")
+        return {'statusCode': 200, 'body': 'Session already running'}
 
     # Extract comment text
     comment_body = comment.get('body', '')
@@ -740,6 +807,7 @@ def start_agent_task(session_id: str, pr_number: int, branch: str,
             cluster=cluster,
             taskDefinition=task_definition,
             launchType='FARGATE',
+            enableExecuteCommand=True,  # Enable ECS Exec for UAT access
             networkConfiguration={
                 'awsvpcConfiguration': {
                     'subnets': [s.strip() for s in subnets if s.strip()],
@@ -762,19 +830,34 @@ def start_agent_task(session_id: str, pr_number: int, branch: str,
 
         if response.get('tasks'):
             task_arn = response['tasks'][0]['taskArn']
+            task_id = task_arn.split('/')[-1]  # Extract task ID from ARN
             print(f"Started agent task: {task_arn}")
+
+            # Build UAT connection command
+            container_name = os.environ.get('CONTAINER_NAME', 'claude-cloud-agent')
+            uat_command = (
+                f"aws ecs execute-command --cluster {cluster} "
+                f"--task {task_id} --container {container_name} "
+                f"--interactive --command /bin/bash"
+            )
 
             sessions_table.update_item(
                 Key={'session_id': session_id},
-                UpdateExpression='SET agent_task_arn = :arn, #status = :status',
+                UpdateExpression='SET agent_task_arn = :arn, #status = :status, uat_command = :cmd',
                 ExpressionAttributeNames={'#status': 'status'},
                 ExpressionAttributeValues={
                     ':arn': task_arn,
-                    ':status': 'running'
+                    ':status': 'running',
+                    ':cmd': uat_command
                 }
             )
+
+            # Return task info for UAT link posting
+            return {'task_arn': task_arn, 'task_id': task_id, 'uat_command': uat_command}
         else:
             print(f"Failed to start agent task: {response.get('failures', [])}")
+            return None
 
     except Exception as e:
         print(f"Error starting agent task: {e}")
+        return None

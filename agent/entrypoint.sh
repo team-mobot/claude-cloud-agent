@@ -11,8 +11,20 @@ echo "PR Number: $PR_NUMBER"
 echo "Branch: $BRANCH"
 echo "Repo: $REPO"
 echo "Source: ${SOURCE:-github}"
+echo "Dev Server Port: ${DEV_SERVER_PORT:-3000}"
 if [ -n "$JIRA_ISSUE_KEY" ]; then
     echo "JIRA Issue: $JIRA_ISSUE_KEY"
+fi
+
+# Get the container's public IP for UAT access
+echo "Discovering public IP..."
+PUBLIC_IP=$(curl -s --max-time 5 http://checkip.amazonaws.com 2>/dev/null || curl -s --max-time 5 http://ifconfig.me 2>/dev/null || echo "")
+if [ -n "$PUBLIC_IP" ]; then
+    export PUBLIC_IP
+    export DEV_SERVER_PORT="${DEV_SERVER_PORT:-3000}"
+    echo "Public IP: $PUBLIC_IP"
+else
+    echo "Warning: Could not determine public IP"
 fi
 
 # Validate required environment variables
@@ -113,22 +125,32 @@ jira_issue_key = os.environ.get('JIRA_ISSUE_KEY', '')
 jira_site = os.environ.get('JIRA_SITE', '')
 jira_email = os.environ.get('JIRA_EMAIL', '')
 jira_api_token = os.environ.get('JIRA_API_TOKEN', '')
+public_ip = os.environ.get('PUBLIC_IP', '')
+dev_server_port = os.environ.get('DEV_SERVER_PORT', '3000')
 
 gh_headers = {
     'Authorization': f'token {token}',
     'Accept': 'application/vnd.github+json'
 }
 
+# Build UAT access info
+uat_info = ""
+if public_ip:
+    uat_info = f"""
+
+**UAT Access**
+- Dev Server URL: http://{public_ip}:{dev_server_port}
+- The server will be available once Claude starts it
+"""
+
 if is_resume:
-    body = '''**Claude Cloud Agent Resuming** 🔄
+    body = f'''**Claude Cloud Agent Resuming** 🔄
 
-Processing your feedback...
-'''
+Processing your feedback...{uat_info}'''
 else:
-    body = '''**Claude Cloud Agent Started** 🤖
+    body = f'''**Claude Cloud Agent Started** 🤖
 
-Starting Claude Code session...
-'''
+Starting Claude Code session...{uat_info}'''
 
 # Post to GitHub PR
 requests.post(
@@ -194,15 +216,20 @@ resp = requests.get(
     f'https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=10&direction=desc',
     headers=headers
 )
-comments = resp.json()[::-1]  # Reverse to chronological order
+data = resp.json()
 
-context = "## Recent PR Comments (for context)\n\n"
-for c in comments[-5:]:  # Last 5 comments
-    user = c['user']['login']
-    body = c['body'][:500]  # Truncate long comments
-    context += f"**{user}:**\n{body}\n\n---\n\n"
-
-print(context)
+# Handle error responses (dict) vs success (list)
+if isinstance(data, list):
+    comments = data[::-1]  # Reverse to chronological order
+    context = "## Recent PR Comments (for context)\n\n"
+    for c in comments[-5:]:  # Last 5 comments
+        user = c.get('user', {}).get('login', 'unknown')
+        body = c.get('body', '')[:500]  # Truncate long comments
+        context += f"**{user}:**\n{body}\n\n---\n\n"
+    print(context)
+else:
+    # API error - just print empty context
+    print("")
 PYEOF
 )
 fi
@@ -215,16 +242,17 @@ Important instructions:
 2. Repository: $REPO
 3. PR Number: $PR_NUMBER
 4. Before starting work, check README.md and CLAUDE.md for development setup instructions. You have sudo access - if prerequisites like PostgreSQL, Redis, or other services are required but not installed, install and start them (e.g., sudo apt-get update && sudo apt-get install -y postgresql && sudo service postgresql start). Set up any required databases, run migrations, etc.
-5. Make commits as you work - commit early and often
-6. Push your changes to the remote branch
-7. You can read PR comments with: gh pr view $PR_NUMBER --repo $REPO --comments
-8. When done, summarize what you accomplished
+5. **UAT SERVER REQUIRED**: After setup, start the dev server in the background on port ${DEV_SERVER_PORT:-3000} and keep it running throughout your session. Use the project's dev server command (npm run dev, python manage.py runserver, etc.) or a simple HTTP server. Run it with nohup or & to keep it running. The UAT URL http://${PUBLIC_IP:-localhost}:${DEV_SERVER_PORT:-3000} has been shared for testing.
+6. Make commits as you work - commit early and often
+7. Push your changes to the remote branch
+8. You can read PR comments with: gh pr view $PR_NUMBER --repo $REPO --comments
+9. When done, summarize what you accomplished
 PROMPT_EOF
 
 # Add JIRA context if applicable
 if [ "$SOURCE" = "jira" ] && [ -n "$JIRA_ISSUE_KEY" ]; then
     echo "" >> /tmp/prompt.txt
-    echo "9. This task originated from JIRA issue $JIRA_ISSUE_KEY" >> /tmp/prompt.txt
+    echo "10. This task originated from JIRA issue $JIRA_ISSUE_KEY" >> /tmp/prompt.txt
 fi
 
 # Add PR context for resumed sessions
@@ -305,10 +333,11 @@ def post_jira_comment(body):
     except Exception as e:
         print(f"Error posting JIRA comment: {e}")
 
-def post_comment(body):
-    """Post a comment to GitHub (always) and JIRA (if applicable)."""
+def post_comment(body, to_jira=False):
+    """Post a comment to GitHub (always) and JIRA (only if to_jira=True)."""
     post_github_comment(body)
-    post_jira_comment(body)
+    if to_jira:
+        post_jira_comment(body)
 
 def format_tool_use(tool_name, tool_input):
     """Format a tool use for display."""
@@ -383,7 +412,8 @@ while True:
                         if item.get('type') == 'text':
                             text = item.get('text', '').strip()
                             if text:
-                                post_comment(f"💬 **Claude:**\n\n{text}")
+                                # Claude's text responses are summaries - send to JIRA
+                                post_comment(f"💬 **Claude:**\n\n{text}", to_jira=True)
 
                         elif item.get('type') == 'tool_use':
                             tool_name = item.get('name', 'unknown')
@@ -391,7 +421,9 @@ while True:
                             tool_id = item.get('id', '')
                             pending_tool_uses[tool_id] = (tool_name, tool_input)
                             formatted = format_tool_use(tool_name, tool_input)
-                            post_comment(formatted)
+                            # Only send AskUserQuestion to JIRA (questions need user response)
+                            to_jira = tool_name == 'AskUserQuestion'
+                            post_comment(formatted, to_jira=to_jira)
 
                 elif msg_type == 'user':
                     message = data.get('message', {})
@@ -413,11 +445,13 @@ while True:
                                 result = tool_result
 
                             formatted = format_tool_result(result, is_error)
-                            post_comment(formatted)
+                            # Tool results only go to GitHub, not JIRA
+                            post_comment(formatted, to_jira=False)
 
             except json.JSONDecodeError:
                 if line.strip() and not line.startswith('{'):
-                    post_comment(f"```\n{line}\n```")
+                    # Raw output only goes to GitHub
+                    post_comment(f"```\n{line}\n```", to_jira=False)
             except Exception as e:
                 print(f"Error processing line: {e}")
 
@@ -519,3 +553,67 @@ aws dynamodb update-item \
     --expression-attribute-values '{":status": {"S": "completed"}}'
 
 echo "=== Claude Cloud Agent Complete ==="
+
+# Keep container alive for UAT testing until PR is closed
+echo "=== UAT Server Running ==="
+echo "Dev server URL: http://${PUBLIC_IP:-localhost}:${DEV_SERVER_PORT:-3000}"
+echo "Container will run until the PR is closed or merged."
+echo ""
+
+# Post UAT notification and poll for PR closure
+python3 << 'PYEOF'
+import requests
+import os
+import time
+
+token = os.environ['INSTALLATION_TOKEN']
+repo = os.environ['REPO']
+pr_number = os.environ['PR_NUMBER']
+public_ip = os.environ.get('PUBLIC_IP', 'localhost')
+dev_port = os.environ.get('DEV_SERVER_PORT', '3000')
+
+gh_headers = {
+    'Authorization': f'token {token}',
+    'Accept': 'application/vnd.github+json'
+}
+
+# Post UAT notification
+body = f'''**UAT Server Running** 🧪
+
+The dev server is now available for testing:
+- **URL:** http://{public_ip}:{dev_port}
+
+The server will remain running until this PR is closed or merged.'''
+
+requests.post(
+    f'https://api.github.com/repos/{repo}/issues/{pr_number}/comments',
+    headers=gh_headers,
+    json={'body': body}
+)
+
+# Poll for PR closure every 60 seconds
+print(f"Polling PR #{pr_number} status...")
+while True:
+    time.sleep(60)
+    try:
+        resp = requests.get(
+            f'https://api.github.com/repos/{repo}/pulls/{pr_number}',
+            headers=gh_headers
+        )
+        if resp.status_code == 200:
+            pr_data = resp.json()
+            state = pr_data.get('state', 'open')
+            merged = pr_data.get('merged', False)
+
+            if state == 'closed' or merged:
+                print(f"PR #{pr_number} is {'merged' if merged else 'closed'}. Shutting down.")
+                break
+        else:
+            print(f"Error checking PR status: {resp.status_code}")
+    except Exception as e:
+        print(f"Error polling PR: {e}")
+
+print("UAT server stopping.")
+PYEOF
+
+echo "PR closed. Container stopping."
