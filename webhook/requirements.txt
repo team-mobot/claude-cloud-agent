@@ -1,4 +1,0 @@
-PyGithub
-PyJWT
-requests
-boto3
