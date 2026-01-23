@@ -28,6 +28,15 @@ Parameters:
     Default: 'claude-dev'
     Description: Label that triggers agent sessions (used for both GitHub and JIRA)
 
+  UatCertificateArn:
+    Type: String
+    Description: ARN of ACM certificate for *.uat.teammobot.dev
+
+  UatDomain:
+    Type: String
+    Default: 'uat.teammobot.dev'
+    Description: Domain suffix for UAT URLs (e.g., session-id.uat.teammobot.dev)
+
 Conditions:
   HasJiraSecret: !Not [!Equals [!Ref JiraSecretArn, '']]
 
@@ -84,6 +93,7 @@ Resources:
           SUBNETS: !Join [',', !Ref PublicSubnets]
           SECURITY_GROUPS: !Ref AgentSecurityGroup
           TRIGGER_LABEL: !Ref TriggerLabel
+          UAT_DOMAIN: !Ref UatDomain
       Code:
         S3Bucket: !Ref ArtifactBucket
         S3Key: webhook/handler.zip
@@ -289,9 +299,187 @@ Resources:
     Properties:
       GroupDescription: Security group for Claude Cloud Agent tasks
       VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Agent API - Lambda/proxy sends prompts here
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        # Backend API (Express)
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          CidrIp: 0.0.0.0/0
+        # Frontend dev server (Vite)
+        - IpProtocol: tcp
+          FromPort: 5173
+          ToPort: 5173
+          CidrIp: 0.0.0.0/0
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
+
+  #############################################
+  # UAT Proxy (Fargate Spot)
+  #############################################
+
+  UatProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for UAT Proxy
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref UatAlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  UatAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for UAT ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  UatAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: claude-cloud-agent-uat
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref UatAlbSecurityGroup
+      Subnets: !Ref PublicSubnets
+
+  UatAlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: claude-cloud-agent-uat-proxy
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+
+  UatAlbListenerHttps:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref UatAlb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref UatCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref UatAlbTargetGroup
+
+  UatAlbListenerHttp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref UatAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: '443'
+            StatusCode: HTTP_301
+
+  UatProxyTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: claude-cloud-agent-uat-proxy
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt AgentExecutionRole.Arn
+      TaskRoleArn: !GetAtt UatProxyTaskRole.Arn
+      ContainerDefinitions:
+        - Name: uat-proxy
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/claude-cloud-agent-uat-proxy:latest'
+          PortMappings:
+            - ContainerPort: 8080
+          Environment:
+            - Name: SESSION_TABLE
+              Value: !Ref SessionTable
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref UatProxyLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: proxy
+
+  UatProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/claude-cloud-agent-uat-proxy
+      RetentionInDays: 7
+
+  UatProxyService:
+    Type: AWS::ECS::Service
+    DependsOn: UatAlbListenerHttps
+    Properties:
+      ServiceName: claude-cloud-agent-uat-proxy
+      Cluster: !Ref AgentCluster
+      TaskDefinition: !Ref UatProxyTaskDefinition
+      DesiredCount: 1
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref UatProxySecurityGroup
+          Subnets: !Ref PublicSubnets
+      LoadBalancers:
+        - ContainerName: uat-proxy
+          ContainerPort: 8080
+          TargetGroupArn: !Ref UatAlbTargetGroup
+
+  UatProxyTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: UatProxyPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt SessionTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
 
 Outputs:
   WebhookUrl:
@@ -305,3 +493,11 @@ Outputs:
   AgentClusterName:
     Description: ECS cluster for agent tasks
     Value: !Ref AgentCluster
+
+  UatAlbDnsName:
+    Description: DNS name of UAT ALB - create CNAME *.uat.teammobot.dev pointing here
+    Value: !GetAtt UatAlb.DNSName
+
+  UatDomain:
+    Description: UAT domain suffix for session URLs
+    Value: !Ref UatDomain
