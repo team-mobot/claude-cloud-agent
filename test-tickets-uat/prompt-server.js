@@ -44,11 +44,8 @@ function runClaude(prompt) {
       env: {
         ...process.env,
         CLAUDE_CODE_USE_BEDROCK: '1',
-        // Ensure AWS credentials are passed through
-        AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
-        AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
-        AWS_SESSION_TOKEN: process.env.AWS_SESSION_TOKEN,
         AWS_REGION: process.env.AWS_REGION || 'us-east-1'
+        // AWS credentials come from IAM task role on ECS or env vars locally
       }
     });
 
