@@ -409,18 +409,25 @@ def handle_issue_comment(
             "body": json.dumps({"message": "Container not ready"})
         }
 
-    # Forward comment to container
+    # Forward comment to container with GitHub context for posting responses
     import requests
     try:
         prompt_url = f"http://{container_ip}:8080/prompt"
         logger.info(f"Forwarding comment to {prompt_url}")
 
+        # Parse owner/repo from full_name
+        owner, repo_name = repo_full_name.split("/", 1)
+
         response = requests.post(
             prompt_url,
             json={
                 "prompt": comment_body,
-                "author": comment_author,
-                "comment_id": comment.get("id")
+                "github": {
+                    "owner": owner,
+                    "repo": repo_name,
+                    "prNumber": pr_number,
+                    "token": github.get_token()
+                }
             },
             timeout=10
         )
