@@ -429,7 +429,7 @@ def handle_issue_comment(
                     "token": github.get_token()
                 }
             },
-            timeout=10
+            timeout=30  # Prompt server should return quickly after accepting
         )
         response.raise_for_status()
 
@@ -443,19 +443,12 @@ def handle_issue_comment(
         }
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to forward comment: {e}")
-        # Mark session as failed
-        sessions.update_session(session["session_id"], status="FAILED")
-
-        # Post error to PR
-        github.create_issue_comment(
-            repo_full_name,
-            pr_number,
-            f"<!-- claude-agent -->\n:warning: **Agent Error**\n\nFailed to reach the agent container. The session has been marked as failed.\n\nTo restart, remove and re-add the `{TRIGGER_LABEL}` label on the original issue."
-        )
+        # Don't mark session as failed - just log the error
+        # The container might still be processing or temporarily unavailable
 
         return {
             "statusCode": 200,
-            "body": json.dumps({"message": "Session marked failed"})
+            "body": json.dumps({"message": f"Failed to forward: {e}"})
         }
 
 

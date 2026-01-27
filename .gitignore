@@ -32,6 +32,7 @@ Thumbs.db
 lambda-pkg/
 lambda-pkg-new/
 webhook-deploy/
+webhook_package/
 wheels/
 infrastructure/
 

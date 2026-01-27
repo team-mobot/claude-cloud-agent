@@ -88,7 +88,7 @@ async function processQueue() {
   if (isProcessing || promptQueue.length === 0) return;
 
   isProcessing = true;
-  const { prompt, github, resolve, reject } = promptQueue.shift();
+  const { prompt, github } = promptQueue.shift();
 
   console.log(`[Prompt Server] Processing prompt: ${prompt.substring(0, 100)}...`);
 
@@ -100,15 +100,13 @@ async function processQueue() {
       try {
         const comment = formatAgentOutput(result.output, result.success);
         await postGitHubComment(github.owner, github.repo, github.prNumber, comment, github.token);
-        result.githubCommentPosted = true;
+        console.log(`[Prompt Server] Posted response to GitHub`);
       } catch (ghError) {
         console.error(`[Prompt Server] Failed to post GitHub comment: ${ghError.message}`);
-        result.githubCommentError = ghError.message;
       }
     }
-
-    resolve(result);
   } catch (error) {
+    console.error(`[Prompt Server] Claude error: ${error.message}`);
     // Post error to GitHub if context provided
     if (github && github.token && github.owner && github.repo && github.prNumber) {
       try {
@@ -118,7 +116,6 @@ async function processQueue() {
         console.error(`[Prompt Server] Failed to post error to GitHub: ${ghError.message}`);
       }
     }
-    reject(error);
   }
 
   isProcessing = false;
@@ -239,14 +236,17 @@ const server = http.createServer(async (req, res) => {
         // Update activity timestamp
         updateLastActivity();
 
-        // Add to queue and wait for result
-        const result = await new Promise((resolve, reject) => {
-          promptQueue.push({ prompt, github, resolve, reject });
-          processQueue();
-        });
+        // Add to queue (fire and forget - response posted to GitHub async)
+        promptQueue.push({ prompt, github });
+        processQueue();
 
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result));
+        // Return immediately - processing happens async
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          message: 'Prompt accepted',
+          queueLength: promptQueue.length,
+          isProcessing
+        }));
 
       } catch (error) {
         console.error(`[Prompt Server] Error: ${error.message}`);
