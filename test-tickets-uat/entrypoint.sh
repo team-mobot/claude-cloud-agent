@@ -6,7 +6,7 @@ echo "  Branch: ${BRANCH:-main}"
 echo "  Session: ${SESSION_ID:-unknown}"
 
 # Clone repository
-echo "[1/5] Cloning repository..."
+echo "[1/6] Cloning repository..."
 REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO:-team-mobot/test_tickets}.git"
 git clone --depth 1 --branch "${BRANCH:-main}" "$REPO_URL" /app/repo 2>&1 || {
     echo "Failed to clone branch ${BRANCH}, trying main..."
@@ -14,7 +14,7 @@ git clone --depth 1 --branch "${BRANCH:-main}" "$REPO_URL" /app/repo 2>&1 || {
 }
 cd /app/repo
 
-echo "[2/5] Installing dependencies..."
+echo "[2/6] Installing dependencies..."
 npm ci --include=dev 2>&1
 
 # Install server dependencies if separate package
@@ -29,7 +29,7 @@ fi
 export VITE_GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}"
 export VITE_API_URL=""
 
-echo "[3/5] Building frontend..."
+echo "[3/6] Building frontend..."
 npm run build 2>&1 || {
     echo "Build failed, trying with explicit paths..."
     ./node_modules/.bin/tsc -b && ./node_modules/.bin/vite build
@@ -43,7 +43,7 @@ if [ -f "server/package.json" ]; then
 fi
 
 # Register with DynamoDB and ALB target group
-echo "[4/5] Registering container..."
+echo "[4/6] Registering container..."
 if [ -n "$SESSIONS_TABLE" ] && [ -n "$SESSION_ID" ]; then
     # Get container's private IP from ECS metadata
     TASK_METADATA=$(curl -s "${ECS_CONTAINER_METADATA_URI_V4}/task" 2>/dev/null || echo "{}")
@@ -147,11 +147,17 @@ fi
 export NODE_ENV=production
 export FRONTEND_URL="https://${SESSION_ID:-localhost}.uat.teammobot.dev"
 export MOBOT_BASE_URL="${MOBOT_BASE_URL:-https://app.teammobot.dev}"
+export WORK_DIR="/app/repo"
 
-echo "[5/5] Starting dev server..."
+echo "[5/6] Starting prompt server..."
+echo "  Prompt API on port 8080"
+node /app/prompt-server.js &
+PROMPT_SERVER_PID=$!
+
+echo "[6/6] Starting dev server..."
 echo "  FRONTEND_URL: $FRONTEND_URL"
 echo "  MOBOT_BASE_URL: $MOBOT_BASE_URL"
-echo "  Listening on port 3001"
+echo "  UAT server on port 3001"
 
 # Run dev server with hot reload
 if [ -f "server/package.json" ]; then
