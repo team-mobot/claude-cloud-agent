@@ -47,6 +47,7 @@ echo "[4/6] Registering container..."
 if [ -n "$SESSIONS_TABLE" ] && [ -n "$SESSION_ID" ]; then
     # Get container's IPs from ECS metadata
     TASK_METADATA=$(curl -s "${ECS_CONTAINER_METADATA_URI_V4}/task" 2>/dev/null || echo "{}")
+    CONTAINER_METADATA=$(curl -s "${ECS_CONTAINER_METADATA_URI_V4}" 2>/dev/null || echo "{}")
 
     # Private IP for ALB target group registration
     PRIVATE_IP=$(echo "$TASK_METADATA" | grep -o '"PrivateIPv4Address":"[^"]*"' | head -1 | cut -d'"' -f4)
@@ -55,13 +56,40 @@ if [ -n "$SESSIONS_TABLE" ] && [ -n "$SESSION_ID" ]; then
     fi
 
     # Public IP for webhook routing (Lambda needs to reach container over internet)
-    # Get ENI ID from task metadata, then query EC2 for public IP
-    ENI_ID=$(echo "$TASK_METADATA" | grep -o '"networkInterfaceId":"[^"]*"' | head -1 | cut -d'"' -f4)
+    # Try container metadata Networks array for ENI, fall back to task ARN and ECS API
+    ENI_ID=$(echo "$CONTAINER_METADATA" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for network in data.get('Networks', []):
+        # For awsvpc mode, look for NetworkInterfaceId
+        eni = network.get('NetworkInterfaceId', '')
+        if eni:
+            print(eni)
+            sys.exit(0)
+except Exception as e:
+    pass
+" 2>/dev/null)
+
+    # Fallback: use ECS API to get ENI from task
+    if [ -z "$ENI_ID" ]; then
+        TASK_ARN=$(echo "$TASK_METADATA" | python3 -c "import sys,json; print(json.load(sys.stdin).get('TaskARN',''))" 2>/dev/null)
+        CLUSTER=$(echo "$TASK_METADATA" | python3 -c "import sys,json; print(json.load(sys.stdin).get('Cluster',''))" 2>/dev/null)
+        if [ -n "$TASK_ARN" ] && [ -n "$CLUSTER" ]; then
+            ENI_ID=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+                --query 'tasks[0].attachments[?type==`ElasticNetworkInterface`].details[] | [?name==`networkInterfaceId`].value | [0]' \
+                --output text 2>/dev/null)
+        fi
+    fi
+
+    echo "  ENI ID: ${ENI_ID:-not found}"
+
     if [ -n "$ENI_ID" ]; then
         PUBLIC_IP=$(aws ec2 describe-network-interfaces \
             --network-interface-ids "$ENI_ID" \
             --query 'NetworkInterfaces[0].Association.PublicIp' \
             --output text 2>/dev/null)
+        echo "  EC2 API returned: ${PUBLIC_IP:-nothing}"
     fi
 
     # Fallback: try EC2 metadata service (works on some setups)
