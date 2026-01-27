@@ -1,9 +1,29 @@
 const http = require('http');
 const https = require('https');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 
 const PORT = process.env.PROMPT_PORT || 8080;
 const WORK_DIR = process.env.WORK_DIR || '/app/repo';
+const SESSION_ID = process.env.SESSION_ID;
+const SESSIONS_TABLE = process.env.SESSIONS_TABLE;
+
+// Update last activity timestamp in DynamoDB
+function updateLastActivity() {
+  if (!SESSION_ID || !SESSIONS_TABLE) {
+    console.log('[Activity] No session info, skipping activity update');
+    return;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const cmd = `aws dynamodb update-item --table-name "${SESSIONS_TABLE}" --key '{"session_id":{"S":"${SESSION_ID}"}}' --update-expression "SET last_activity = :ts" --expression-attribute-values '{":ts":{"N":"${now}"}}'`;
+
+  try {
+    execSync(cmd, { stdio: 'pipe' });
+    console.log(`[Activity] Updated last_activity for ${SESSION_ID}`);
+  } catch (error) {
+    console.error(`[Activity] Failed to update: ${error.message}`);
+  }
+}
 
 // Post a comment to a GitHub PR
 function postGitHubComment(owner, repo, prNumber, body, token) {
@@ -215,6 +235,9 @@ const server = http.createServer(async (req, res) => {
         if (github) {
           console.log(`[Prompt Server] GitHub context: ${github.owner}/${github.repo}#${github.prNumber}`);
         }
+
+        // Update activity timestamp
+        updateLastActivity();
 
         // Add to queue and wait for result
         const result = await new Promise((resolve, reject) => {
