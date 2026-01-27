@@ -45,15 +45,36 @@ fi
 # Register with DynamoDB and ALB target group
 echo "[4/6] Registering container..."
 if [ -n "$SESSIONS_TABLE" ] && [ -n "$SESSION_ID" ]; then
-    # Get container's private IP from ECS metadata
+    # Get container's IPs from ECS metadata
     TASK_METADATA=$(curl -s "${ECS_CONTAINER_METADATA_URI_V4}/task" 2>/dev/null || echo "{}")
-    CONTAINER_IP=$(echo "$TASK_METADATA" | grep -o '"PrivateIPv4Address":"[^"]*"' | head -1 | cut -d'"' -f4)
 
-    if [ -z "$CONTAINER_IP" ]; then
-        CONTAINER_IP=$(hostname -i 2>/dev/null || echo "localhost")
+    # Private IP for ALB target group registration
+    PRIVATE_IP=$(echo "$TASK_METADATA" | grep -o '"PrivateIPv4Address":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ -z "$PRIVATE_IP" ]; then
+        PRIVATE_IP=$(hostname -i 2>/dev/null || echo "localhost")
     fi
 
-    echo "  Container IP: $CONTAINER_IP"
+    # Public IP for webhook routing (Lambda needs to reach container over internet)
+    # Get ENI ID from task metadata, then query EC2 for public IP
+    ENI_ID=$(echo "$TASK_METADATA" | grep -o '"networkInterfaceId":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ -n "$ENI_ID" ]; then
+        PUBLIC_IP=$(aws ec2 describe-network-interfaces \
+            --network-interface-ids "$ENI_ID" \
+            --query 'NetworkInterfaces[0].Association.PublicIp' \
+            --output text 2>/dev/null)
+    fi
+
+    # Fallback: try EC2 metadata service (works on some setups)
+    if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "None" ]; then
+        PUBLIC_IP=$(curl -s --connect-timeout 2 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "")
+    fi
+
+    # Final fallback to private IP
+    CONTAINER_IP="${PUBLIC_IP:-$PRIVATE_IP}"
+
+    echo "  Private IP: $PRIVATE_IP"
+    echo "  Public IP: ${PUBLIC_IP:-not available}"
+    echo "  Using for webhook: $CONTAINER_IP"
 
     # Create session-specific target group for subdomain routing
     SESSION_TG_NAME="${SESSION_ID}-tg"
@@ -84,10 +105,10 @@ if [ -n "$SESSIONS_TABLE" ] && [ -n "$SESSION_ID" ]; then
     if [ -n "$SESSION_TG_ARN" ] && [ "$SESSION_TG_ARN" != "None" ]; then
         echo "  Target group ARN: $SESSION_TG_ARN"
 
-        # Register container with session-specific target group
+        # Register container with session-specific target group (use private IP for VPC routing)
         aws elbv2 register-targets \
             --target-group-arn "$SESSION_TG_ARN" \
-            --targets "Id=$CONTAINER_IP,Port=3001" \
+            --targets "Id=$PRIVATE_IP,Port=3001" \
             2>/dev/null && echo "  Registered with session target group"
 
         # Create ALB listener rule for subdomain routing
@@ -122,11 +143,11 @@ if [ -n "$SESSIONS_TABLE" ] && [ -n "$SESSION_ID" ]; then
         fi
     else
         echo "  Warning: Could not create/find target group, falling back to shared target group"
-        # Fallback to shared target group
+        # Fallback to shared target group (use private IP for VPC routing)
         if [ -n "$TARGET_GROUP_ARN" ]; then
             aws elbv2 register-targets \
                 --target-group-arn "$TARGET_GROUP_ARN" \
-                --targets "Id=$CONTAINER_IP,Port=3001" \
+                --targets "Id=$PRIVATE_IP,Port=3001" \
                 2>/dev/null && echo "  Registered with shared ALB target group"
         fi
     fi
