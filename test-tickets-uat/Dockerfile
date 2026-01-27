@@ -13,6 +13,9 @@ RUN apk add --no-cache \
 # Install tsx globally for running TypeScript directly
 RUN npm install -g tsx
 
+# Install Claude Code CLI
+RUN npm install -g @anthropic-ai/claude-code
+
 # Use existing node user (uid 1000) and create workspace
 RUN mkdir -p /app && chown -R node:node /app
 

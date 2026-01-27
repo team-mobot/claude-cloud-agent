@@ -2,7 +2,7 @@
 
 ## Vision
 
-An autonomous development agent that implements features and fixes bugs based on GitHub issues. When a user labels an issue with a trigger label, the system automatically creates a branch, opens a draft PR, and spins up an agent that runs Claude Code. The agent implements the requested changes, commits to the branch, and posts progress as PR comments. Users interact with the agent by commenting on the PR.
+An autonomous development agent that implements features and fixes bugs based on GitHub issues. When a user labels an issue with a trigger label, the system automatically creates a branch, opens a draft PR, and spins up a container running Claude Code. The agent implements the requested changes, commits to the branch, and posts progress as PR comments. Users interact with the agent by commenting on the PR and can test changes via a UAT dev server running in the same container.
 
 ## Problem Statement
 
@@ -11,8 +11,7 @@ Developers want to delegate routine implementation tasks to an AI agent while ma
 1. Work autonomously on well-defined tasks
 2. Provide real-time progress updates
 3. Accept feedback and iterate
-4. Expose a running dev server for UAT testing
-5. Clean up when work is complete
+4. Clean up when work is complete
 
 ## User Experience
 
@@ -21,13 +20,13 @@ Developers want to delegate routine implementation tasks to an AI agent while ma
 1. User creates a GitHub issue describing the work to be done
 2. User adds the `claude-dev` label to the issue
 3. System creates a feature branch and draft PR
-4. System posts a comment with the UAT URL
+4. Agent container starts and reports its UAT URL
 5. Agent begins implementing the requested changes
 
 ### During a Session
 
 - Agent posts progress updates as PR comments
-- User can view work-in-progress at the UAT URL
+- User can view work-in-progress at the UAT URL (via existing UAT proxy infrastructure)
 - User can provide feedback by commenting on the PR
 - Agent incorporates feedback and continues working
 - All changes are committed to the feature branch
@@ -36,7 +35,7 @@ Developers want to delegate routine implementation tasks to an AI agent while ma
 
 - User merges or closes the PR
 - Agent terminates gracefully
-- Resources are cleaned up
+- Container resources are cleaned up
 
 ## Key Design Decisions
 
@@ -45,14 +44,14 @@ Developers want to delegate routine implementation tasks to an AI agent while ma
 Each issue gets a single container that runs for the entire session lifecycle, from issue labeled to PR closed.
 
 **Rationale:**
-- Maintains consistent public IP for UAT access
 - Preserves Claude's conversation context across interactions
 - Avoids startup overhead on each feedback cycle
 - Keeps git working directory state intact
+- Maintains stable UAT URL throughout session
 
-**Alternative rejected:** Spawning a new container for each PR comment would lose context, change the UAT URL, and add ~2 minutes of startup time per interaction.
+**Alternative rejected:** Spawning a new container for each PR comment would lose context, change the UAT URL, and add startup time per interaction.
 
-### 2. Agent and UAT Server in Same Container
+### 2. Agent and Dev Server in Same Container
 
 The container runs both the Claude Code agent and the target application's dev server.
 
@@ -86,16 +85,6 @@ The container discovers and reports its own public IP to the session database, r
 - Avoids Lambda timeout waiting for ECS task startup
 - Container reports "ready" only when actually ready
 
-### 5. UAT via Wildcard Subdomain
-
-UAT is accessed via `{session-id}.uat.example.com` rather than raw IP addresses.
-
-**Rationale:**
-- Preserves authentication cookies from the parent domain
-- Users stay logged in with their real identity
-- TLS termination at the proxy
-- Friendlier URLs in PR comments
-
 ## Requirements
 
 ### Functional Requirements
@@ -107,7 +96,7 @@ UAT is accessed via `{session-id}.uat.example.com` rather than raw IP addresses.
 | F3 | PR comments are routed to running agent |
 | F4 | Agent posts progress updates as PR comments |
 | F5 | Agent commits changes to feature branch |
-| F6 | UAT server is accessible throughout session |
+| F6 | Agent runs the target app's dev server for UAT access |
 | F7 | Session terminates when PR is closed or merged |
 | F8 | Session terminates after configurable idle timeout |
 | F9 | Bot comments do not trigger feedback loops |
@@ -118,9 +107,8 @@ UAT is accessed via `{session-id}.uat.example.com` rather than raw IP addresses.
 |----|-------------|
 | N1 | Session startup completes within 2 minutes |
 | N2 | PR comment routing latency under 5 seconds |
-| N3 | UAT URL remains stable throughout session |
-| N4 | Session state survives temporary network issues |
-| N5 | Failed sessions can be restarted by re-labeling |
+| N3 | Session state survives temporary network issues |
+| N4 | Failed sessions can be restarted by re-labeling |
 
 ## System Components
 
@@ -147,7 +135,7 @@ Maintains state for active sessions.
 
 ### Agent Container
 
-Runs Claude Code and the UAT server.
+Runs Claude Code and the target app's dev server.
 
 **Responsibilities:**
 - Report readiness and IP to session store
@@ -157,16 +145,9 @@ Runs Claude Code and the UAT server.
 - Run the target app's dev server
 - Monitor for PR closure
 
-### UAT Proxy
+### UAT Proxy (Existing Infrastructure)
 
-Routes wildcard subdomain traffic to the correct container.
-
-**Responsibilities:**
-- TLS termination
-- Extract session ID from hostname
-- Look up container IP from session store
-- Forward HTTP and WebSocket traffic
-- Preserve cookies for authentication
+Routes wildcard subdomain traffic to the correct container. Already deployed at `*.uat.teammobot.dev`.
 
 ## Session States
 
@@ -214,10 +195,10 @@ STARTING → RUNNING → COMPLETED
 - Cost optimization via spot instances
 - Session transfer between containers
 
-### Things we've messed up before ###
+## Implementation Notes
 
-- The container must support full-stack development, running the entire stack.
-- The container's UAT environment must auth against staging (app.teammobot.dev) to get the proper .teamobot.dev cookie that then works against *.uat.teammobot.dev
-- ECS needs AMD64 images, not the native AMD64 for the Mac we are building on
-- Claude is running against Bedrock
-- The UAT urls should be dynamic based on the issue.  AGNT-0.uat.teammobot.dev for example.  or xxyysession.uat.teammobot.dev.  Everything must be under .uat.teammobot.dev.
+- The container must support full-stack development, running the entire stack
+- ECS requires AMD64 images (not ARM64 from Mac builds)
+- Claude Code runs against Bedrock
+- UAT URLs are dynamic per session: `{session-id}.uat.teammobot.dev`
+- Authentication flows through staging (app.teammobot.dev) for `.teammobot.dev` cookies

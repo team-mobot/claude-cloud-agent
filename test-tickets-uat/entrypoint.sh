@@ -14,32 +14,32 @@ git clone --depth 1 --branch "${BRANCH:-main}" "$REPO_URL" /app/repo 2>&1 || {
 }
 cd /app/repo
 
-echo "[2/5] Installing frontend dependencies..."
+echo "[2/5] Installing dependencies..."
 npm ci --include=dev 2>&1
 
-echo "[3/5] Building frontend..."
-# Vite needs VITE_* env vars at build time
+# Install server dependencies if separate package
+if [ -f "server/package.json" ]; then
+    echo "  Installing server dependencies..."
+    cd server
+    npm ci --include=dev 2>&1
+    cd ..
+fi
+
+# Set Vite env vars for build
 export VITE_GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}"
 export VITE_API_URL=""
-echo "  VITE_GOOGLE_CLIENT_ID: ${VITE_GOOGLE_CLIENT_ID:0:20}..."
 
+echo "[3/5] Building frontend..."
 npm run build 2>&1 || {
     echo "Build failed, trying with explicit paths..."
     ./node_modules/.bin/tsc -b && ./node_modules/.bin/vite build
 }
 
-# Build server from its own directory (separate package.json)
+# Copy built frontend to public directory (at repo root for tsx watch mode)
 if [ -f "server/package.json" ]; then
-    echo "[3.5/5] Building server (separate package)..."
-    cd server
-    npm ci --include=dev 2>&1
-    npm run build 2>&1
-
-    # Copy built frontend to server's public directory
-    echo "  Copying frontend build to server/public..."
+    echo "  Copying frontend build to public/..."
     mkdir -p public
-    cp -r ../dist/* public/
-    cd ..
+    cp -r dist/* public/
 fi
 
 # Register with DynamoDB and ALB target group
@@ -144,27 +144,19 @@ else
 fi
 
 # Set environment for the app
+export NODE_ENV=production
 export FRONTEND_URL="https://${SESSION_ID:-localhost}.uat.teammobot.dev"
 export MOBOT_BASE_URL="${MOBOT_BASE_URL:-https://app.teammobot.dev}"
 
-echo "[5/5] Starting server..."
+echo "[5/5] Starting dev server..."
 echo "  FRONTEND_URL: $FRONTEND_URL"
 echo "  MOBOT_BASE_URL: $MOBOT_BASE_URL"
 echo "  Listening on port 3001"
 
-# Try to run the server
-# Check for compiled server from server/ directory build
-if [ -f "server/dist/index.js" ]; then
-    echo "  Running compiled server from server/dist/index.js"
+# Run dev server with hot reload
+if [ -f "server/package.json" ]; then
     cd server
-    exec node dist/index.js
-elif [ -f "dist/index.js" ]; then
-    echo "  Running compiled server from dist/index.js"
-    exec node dist/index.js
+    exec npm run dev
 else
-    echo "ERROR: Cannot find compiled server"
-    echo "  Checked: server/dist/index.js, dist/index.js"
-    ls -la server/dist/ 2>/dev/null || echo "  server/dist/ directory does not exist"
-    ls -la dist/ 2>/dev/null || echo "  dist/ directory contents shown above"
-    exit 1
+    exec npm run dev
 fi
