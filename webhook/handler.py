@@ -36,6 +36,7 @@ TRIGGER_LABEL = "claude-dev"
 
 # test_tickets UAT configuration
 TEST_TICKETS_TRIGGER_LABEL = "uat"
+TEST_TICKETS_CLAUDE_LABEL = "claude-dev"  # Auto-starts Claude to implement PR
 TEST_TICKETS_REPO = "team-mobot/test_tickets"
 
 # Lazy-loaded clients and secrets
@@ -781,11 +782,12 @@ def handle_pr_labeled(
     """
     Handle PR labeled event.
 
-    When a PR in test_tickets is labeled with 'uat':
+    When a PR in test_tickets is labeled with 'uat' or 'claude-dev':
     1. Get the branch name from the PR
     2. Create unique session ID
     3. Launch test_tickets ECS task
     4. Post UAT URL to PR
+    5. If 'claude-dev', queue initial prompt for auto-implementation
     """
     pr = payload.get("pull_request", {})
     label = payload.get("label", {})
@@ -794,18 +796,22 @@ def handle_pr_labeled(
     label_name = label.get("name", "")
     repo_full_name = repo.get("full_name", "")
 
-    # Only handle test_tickets repo with uat label
+    # Only handle test_tickets repo
     if repo_full_name != TEST_TICKETS_REPO:
         return {
             "statusCode": 200,
             "body": json.dumps({"message": "Not test_tickets repo"})
         }
 
-    if label_name != TEST_TICKETS_TRIGGER_LABEL:
+    # Check for either uat or claude-dev label
+    is_uat = label_name == TEST_TICKETS_TRIGGER_LABEL
+    is_claude_dev = label_name == TEST_TICKETS_CLAUDE_LABEL
+
+    if not (is_uat or is_claude_dev):
         logger.info(f"Ignoring label: {label_name}")
         return {
             "statusCode": 200,
-            "body": json.dumps({"message": "Not uat label"})
+            "body": json.dumps({"message": "Not uat or claude-dev label"})
         }
 
     if not TEST_TICKETS_TASK_DEFINITION:
@@ -817,6 +823,7 @@ def handle_pr_labeled(
 
     pr_number = pr.get("number")
     pr_title = pr.get("title", "")
+    pr_body = pr.get("body", "") or ""
     branch_name = pr.get("head", {}).get("ref", "")
 
     if not branch_name:
@@ -826,7 +833,7 @@ def handle_pr_labeled(
             "body": json.dumps({"error": "No branch found"})
         }
 
-    logger.info(f"Starting test_tickets UAT for PR #{pr_number} branch {branch_name}")
+    logger.info(f"Starting test_tickets UAT for PR #{pr_number} branch {branch_name} (claude_dev={is_claude_dev})")
 
     # Create session ID (sanitize branch name for subdomain)
     safe_branch = branch_name.replace("/", "-").replace("_", "-").lower()
@@ -866,6 +873,19 @@ def handle_pr_labeled(
         branch_name=branch_name
     )
 
+    # If claude-dev, prepare initial prompt for auto-implementation
+    initial_prompt = None
+    if is_claude_dev:
+        initial_prompt = f"""Implement this PR:
+
+## {pr_title}
+
+{pr_body}
+
+Read the codebase, understand the requirements, and implement the changes.
+Commit your work when complete."""
+        logger.info(f"Queuing initial prompt for claude-dev: {initial_prompt[:100]}...")
+
     # Launch test_tickets ECS task
     logger.info(f"Launching test_tickets ECS task for session {session_id}")
     try:
@@ -893,35 +913,49 @@ def handle_pr_labeled(
             "body": json.dumps({"error": str(e)})
         }
 
-    # Update session with task ARN
+    # Update session with task ARN and initial_prompt (if claude-dev)
     uat_url = f"https://{session_id}.{UAT_DOMAIN_SUFFIX}"
     sessions.update_session(
         session_id,
         task_arn=task_arn,
-        uat_url=uat_url
+        uat_url=uat_url,
+        initial_prompt=initial_prompt
     )
 
-    # Post UAT URL to PR
-    github.create_issue_comment(
-        repo_full_name,
-        pr_number,
-        f"<!-- claude-agent -->\n**UAT Environment Starting**\n\n"
-        f"URL: {uat_url}\n\n"
-        f"Branch: `{branch_name}`\n"
-        f"Session: `{session_id}`\n\n"
-        f"The environment will be available shortly. "
-        f"Authentication uses staging (`app.teammobot.dev`).\n\n"
-        f"To stop this UAT, close the PR or remove the `{TEST_TICKETS_TRIGGER_LABEL}` label."
-    )
+    # Post UAT URL to PR with appropriate message
+    if is_claude_dev:
+        comment = (
+            f"<!-- claude-agent -->\n**UAT + Claude Agent Starting**\n\n"
+            f"URL: {uat_url}\n\n"
+            f"Branch: `{branch_name}`\n"
+            f"Session: `{session_id}`\n\n"
+            f"The environment will be available shortly. "
+            f"Claude will automatically start implementing the PR description.\n\n"
+            f"Comment on this PR to provide feedback or additional instructions.\n\n"
+            f"To stop, close the PR or remove the `{TEST_TICKETS_CLAUDE_LABEL}` label."
+        )
+    else:
+        comment = (
+            f"<!-- claude-agent -->\n**UAT Environment Starting**\n\n"
+            f"URL: {uat_url}\n\n"
+            f"Branch: `{branch_name}`\n"
+            f"Session: `{session_id}`\n\n"
+            f"The environment will be available shortly. "
+            f"Authentication uses staging (`app.teammobot.dev`).\n\n"
+            f"To stop this UAT, close the PR or remove the `{TEST_TICKETS_TRIGGER_LABEL}` label."
+        )
 
-    logger.info(f"test_tickets UAT session {session_id} started from PR")
+    github.create_issue_comment(repo_full_name, pr_number, comment)
+
+    logger.info(f"test_tickets UAT session {session_id} started from PR (claude_dev={is_claude_dev})")
     return {
         "statusCode": 200,
         "body": json.dumps({
             "message": "UAT started",
             "session_id": session_id,
             "uat_url": uat_url,
-            "task_arn": task_arn
+            "task_arn": task_arn,
+            "claude_dev": is_claude_dev
         })
     }
 
@@ -955,21 +989,27 @@ def handle_pr_unlabeled_or_closed(
             "body": json.dumps({"message": "Not test_tickets repo"})
         }
 
-    # For unlabeled events, only handle 'uat' label removal
-    if action == "unlabeled" and label.get("name") != TEST_TICKETS_TRIGGER_LABEL:
-        return {
-            "statusCode": 200,
-            "body": json.dumps({"message": "Not uat label"})
-        }
-
-    # For closed events, check if the PR had the uat label
-    if action == "closed":
-        labels = pr.get("labels", [])
-        has_uat_label = any(l.get("name") == TEST_TICKETS_TRIGGER_LABEL for l in labels)
-        if not has_uat_label:
+    # For unlabeled events, only handle 'uat' or 'claude-dev' label removal
+    if action == "unlabeled":
+        removed_label = label.get("name")
+        if removed_label not in (TEST_TICKETS_TRIGGER_LABEL, TEST_TICKETS_CLAUDE_LABEL):
             return {
                 "statusCode": 200,
-                "body": json.dumps({"message": "PR did not have uat label"})
+                "body": json.dumps({"message": "Not uat or claude-dev label"})
+            }
+
+    # For closed events, check if the PR had either uat or claude-dev label
+    if action == "closed":
+        labels = pr.get("labels", [])
+        label_names = [l.get("name") for l in labels]
+        has_trigger_label = (
+            TEST_TICKETS_TRIGGER_LABEL in label_names or
+            TEST_TICKETS_CLAUDE_LABEL in label_names
+        )
+        if not has_trigger_label:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "PR did not have uat or claude-dev label"})
             }
 
     # Derive session_id from branch name (same logic as handle_pr_labeled)

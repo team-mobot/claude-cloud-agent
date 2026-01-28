@@ -137,7 +137,9 @@ class SessionManager:
         container_ip: Optional[str] = None,
         task_arn: Optional[str] = None,
         uat_url: Optional[str] = None,
-        last_activity: Optional[int] = None
+        last_activity: Optional[int] = None,
+        claude_session_id: Optional[str] = None,
+        initial_prompt: Optional[str] = None
     ) -> dict:
         """
         Update a session.
@@ -149,6 +151,8 @@ class SessionManager:
             task_arn: ECS task ARN
             uat_url: UAT preview URL
             last_activity: Timestamp of last activity
+            claude_session_id: Claude session ID for --resume continuity
+            initial_prompt: Auto-start prompt for claude-dev label
 
         Returns:
             Updated session record
@@ -188,6 +192,16 @@ class SessionManager:
             update_expr_parts.append("#last_activity = :last_activity")
             expr_names["#last_activity"] = "last_activity"
             expr_values[":last_activity"] = last_activity
+
+        if claude_session_id is not None:
+            update_expr_parts.append("#claude_session_id = :claude_session_id")
+            expr_names["#claude_session_id"] = "claude_session_id"
+            expr_values[":claude_session_id"] = claude_session_id
+
+        if initial_prompt is not None:
+            update_expr_parts.append("#initial_prompt = :initial_prompt")
+            expr_names["#initial_prompt"] = "initial_prompt"
+            expr_values[":initial_prompt"] = initial_prompt
 
         update_expr = "SET " + ", ".join(update_expr_parts)
 
