@@ -6,7 +6,7 @@ echo "  Branch: ${BRANCH:-main}"
 echo "  Session: ${SESSION_ID:-unknown}"
 
 # Clone repository
-echo "[1/6] Cloning repository..."
+echo "[1/8] Cloning repository..."
 REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO:-team-mobot/test_tickets}.git"
 git clone --depth 1 --branch "${BRANCH:-main}" "$REPO_URL" /app/repo 2>&1 || {
     echo "Failed to clone branch ${BRANCH}, trying main..."
@@ -14,7 +14,7 @@ git clone --depth 1 --branch "${BRANCH:-main}" "$REPO_URL" /app/repo 2>&1 || {
 }
 cd /app/repo
 
-echo "[2/6] Installing dependencies..."
+echo "[2/8] Installing dependencies..."
 npm ci --include=dev 2>&1
 
 # Install server dependencies if separate package
@@ -25,25 +25,28 @@ if [ -f "server/package.json" ]; then
     cd ..
 fi
 
-# Set Vite env vars for build
+# Set Vite env vars
 export VITE_GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}"
 export VITE_API_URL=""
 
-echo "[3/6] Building frontend..."
-npm run build 2>&1 || {
-    echo "Build failed, trying with explicit paths..."
-    ./node_modules/.bin/tsc -b && ./node_modules/.bin/vite build
-}
+echo "[3/8] Starting Vite dev server..."
+# Start Vite in background with network access enabled
+npm run dev -- --host 0.0.0.0 --port 5173 &
+VITE_PID=$!
+echo "  Vite dev server started (PID: $VITE_PID) on port 5173"
 
-# Copy built frontend to public directory (at repo root for tsx watch mode)
-if [ -f "server/package.json" ]; then
-    echo "  Copying frontend build to public/..."
-    mkdir -p public
-    cp -r dist/* public/
-fi
+# Wait for Vite to be ready
+echo "  Waiting for Vite to start..."
+for i in $(seq 1 30); do
+    if curl -s http://localhost:5173 > /dev/null 2>&1; then
+        echo "  Vite is ready"
+        break
+    fi
+    sleep 1
+done
 
 # Register with DynamoDB and ALB target group
-echo "[4/6] Registering container..."
+echo "[4/8] Registering container..."
 if [ -n "$SESSIONS_TABLE" ] && [ -n "$SESSION_ID" ]; then
     # Get container's IPs from ECS metadata
     TASK_METADATA=$(curl -s "${ECS_CONTAINER_METADATA_URI_V4}/task" 2>/dev/null || echo "{}")
@@ -192,23 +195,31 @@ else
     echo "  Warning: SESSIONS_TABLE or SESSION_ID not set, skipping registration"
 fi
 
-# Set environment for the app
-export NODE_ENV=production
+echo "[5/8] Setting environment..."
+export NODE_ENV=development
 export FRONTEND_URL="https://${SESSION_ID:-localhost}.uat.teammobot.dev"
 export MOBOT_BASE_URL="${MOBOT_BASE_URL:-https://app.teammobot.dev}"
 export WORK_DIR="/app/repo"
+export VITE_DEV_SERVER="http://localhost:5173"
+echo "  NODE_ENV: $NODE_ENV"
 
-echo "[5/6] Starting prompt server..."
+echo "[6/8] Starting prompt server..."
 echo "  Prompt API on port 8080"
 node /app/prompt-server.js &
 PROMPT_SERVER_PID=$!
 
-echo "[6/6] Starting dev server..."
+echo "[7/8] Starting dev proxy..."
+echo "  Proxy on port 3001 -> API (3002) + Vite (5173)"
+PROXY_PORT=3001 VITE_PORT=5173 EXPRESS_PORT=3002 node /app/dev-proxy.js &
+PROXY_PID=$!
+
+echo "[8/8] Starting Express server..."
 echo "  FRONTEND_URL: $FRONTEND_URL"
 echo "  MOBOT_BASE_URL: $MOBOT_BASE_URL"
-echo "  UAT server on port 3001"
+echo "  Express API on port 3002"
 
-# Run dev server with hot reload
+# Run Express server with hot reload on port 3002
+export PORT=3002
 if [ -f "server/package.json" ]; then
     cd server
     exec npm run dev
