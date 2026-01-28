@@ -883,7 +883,7 @@ def handle_pr_labeled(
 {pr_body}
 
 Read the codebase, understand the requirements, and implement the changes.
-Commit your work when complete."""
+Commit your work when complete and push to the remote branch."""
         logger.info(f"Queuing initial prompt for claude-dev: {initial_prompt[:100]}...")
 
     # Launch test_tickets ECS task

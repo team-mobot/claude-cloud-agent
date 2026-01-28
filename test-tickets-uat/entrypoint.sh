@@ -14,6 +14,38 @@ git clone --depth 1 --branch "${BRANCH:-main}" "$REPO_URL" /app/repo 2>&1 || {
 }
 cd /app/repo
 
+# Configure git identity for commits
+git config user.email "claude-dev@teammobot.dev"
+git config user.name "Claude Dev Agent"
+
+# Patch Vite config to allow UAT subdomain hosts
+echo "  Patching Vite config for UAT subdomains..."
+node -e "
+const fs = require('fs');
+const configs = ['vite.config.ts', 'vite.config.js', 'vite.config.mts', 'vite.config.mjs'];
+const config = configs.find(f => fs.existsSync(f));
+if (config) {
+    let content = fs.readFileSync(config, 'utf8');
+    // Check if allowedHosts already configured
+    if (!content.includes('allowedHosts')) {
+        // Add allowedHosts to existing server config or create server config
+        if (content.includes('server:') || content.includes('server :')) {
+            // Insert after 'server: {' or 'server:{'
+            content = content.replace(/(server\s*:\s*\{)/, '\$1 allowedHosts: true,');
+        } else {
+            // Add server config before final closing brace of defineConfig
+            content = content.replace(/(\}\s*\)\s*;?\s*)$/, ', server: { allowedHosts: true } \$1');
+        }
+        fs.writeFileSync(config, content);
+        console.log('  Patched ' + config + ' with allowedHosts: true');
+    } else {
+        console.log('  ' + config + ' already has allowedHosts configured');
+    }
+} else {
+    console.log('  No vite config found, skipping patch');
+}
+"
+
 echo "[2/8] Installing dependencies..."
 npm ci --include=dev 2>&1
 
@@ -30,6 +62,24 @@ export VITE_GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}"
 export VITE_API_URL=""
 
 echo "[3/8] Starting Vite dev server..."
+# Re-apply Vite config patch (in case it was reverted during development)
+node -e "
+const fs = require('fs');
+const configs = ['vite.config.ts', 'vite.config.js', 'vite.config.mts', 'vite.config.mjs'];
+const config = configs.find(f => fs.existsSync(f));
+if (config) {
+    let content = fs.readFileSync(config, 'utf8');
+    if (!content.includes('allowedHosts')) {
+        if (content.includes('server:') || content.includes('server :')) {
+            content = content.replace(/(server\s*:\s*\{)/, '\$1 allowedHosts: true,');
+        } else {
+            content = content.replace(/(\}\s*\)\s*;?\s*)$/, ', server: { allowedHosts: true } \$1');
+        }
+        fs.writeFileSync(config, content);
+        console.log('  Re-applied Vite allowedHosts patch to ' + config);
+    }
+}
+"
 # Start Vite in background with network access enabled
 npm run dev -- --host 0.0.0.0 --port 5173 &
 VITE_PID=$!
@@ -197,6 +247,8 @@ fi
 
 echo "[5/8] Setting environment..."
 export NODE_ENV=development
+# Accept RDS SSL certificates (Amazon's CA)
+export NODE_TLS_REJECT_UNAUTHORIZED=0
 export FRONTEND_URL="https://${SESSION_ID:-localhost}.uat.teammobot.dev"
 export MOBOT_BASE_URL="${MOBOT_BASE_URL:-https://app.teammobot.dev}"
 export WORK_DIR="/app/repo"
