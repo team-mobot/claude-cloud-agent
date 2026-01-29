@@ -145,7 +145,7 @@ class ChronologicalCommentPoster {
     this.prNumber = prNumber;
     this.token = token;
     this.eventQueue = [];  // Chronological list of formatted event strings
-    this.toolUseById = {};  // Map id -> tool name for matching results
+    this.pendingToolUses = {};  // Map id -> {name, input} for tools awaiting results
     this.flushTimer = null;
     this.isComplete = false;
   }
@@ -195,20 +195,28 @@ class ChronologicalCommentPoster {
   }
 
   addToolUse(id, name, input) {
-    this.toolUseById[id] = name;
+    // Store tool use, wait for result to group them together
     const inputStr = typeof input === 'string' ? input : JSON.stringify(input, null, 2);
-    const truncated = inputStr.length > 500
+    const truncatedInput = inputStr.length > 500
       ? inputStr.substring(0, 500) + '...'
       : inputStr;
-    this.queueEvent(`**🔧 ${name}**\n\`\`\`json\n${truncated}\n\`\`\``);
+    this.pendingToolUses[id] = { name, input: truncatedInput };
   }
 
   addToolResult(toolUseId, result) {
-    const toolName = this.toolUseById[toolUseId] || 'Tool';
-    const truncated = result.length > 1000
+    const pending = this.pendingToolUses[toolUseId];
+    const toolName = pending?.name || 'Tool';
+    const toolInput = pending?.input;
+
+    const truncatedResult = result.length > 1000
       ? result.substring(0, 1000) + '...(truncated)'
       : result;
-    this.queueEvent(`**✅ ${toolName} result**\n\`\`\`\n${truncated}\n\`\`\``);
+
+    // Group tool call and result together
+    let formatted = `**🔧 ${toolName}**\n\`\`\`json\n${toolInput}\n\`\`\`\n\n**Result:**\n\`\`\`\n${truncatedResult}\n\`\`\``;
+
+    this.queueEvent(formatted);
+    delete this.pendingToolUses[toolUseId];
   }
 
   addText(content) {
@@ -222,6 +230,12 @@ class ChronologicalCommentPoster {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+
+    // Flush any pending tool uses that never got results
+    for (const [id, pending] of Object.entries(this.pendingToolUses)) {
+      this.queueEvent(`**🔧 ${pending.name}**\n\`\`\`json\n${pending.input}\n\`\`\`\n\n*Result not captured*`);
+    }
+    this.pendingToolUses = {};
 
     // Add completion marker and flush
     this.queueEvent('**✨ Claude agent completed**');
