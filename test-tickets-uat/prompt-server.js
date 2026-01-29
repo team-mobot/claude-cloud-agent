@@ -11,8 +11,9 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 // Claude session ID for --resume (loaded from DynamoDB)
 let claudeSessionId = null;
 
-// GitHub comment update batching
-const COMMENT_UPDATE_INTERVAL_MS = 3000;
+// Chronological comment posting configuration
+const FLUSH_INTERVAL_MS = 2000;  // Post every 2 seconds
+const MAX_EVENTS_PER_COMMENT = 10;  // Or flush when 10+ events queued
 
 // Update last activity timestamp in DynamoDB
 function updateLastActivity() {
@@ -136,243 +137,95 @@ function postGitHubComment(owner, repo, prNumber, body, token) {
   });
 }
 
-// Update an existing GitHub comment
-function updateGitHubComment(owner, repo, commentId, body, token) {
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify({ body });
-
-    const options = {
-      hostname: 'api.github.com',
-      port: 443,
-      path: `/repos/${owner}/${repo}/issues/comments/${commentId}`,
-      method: 'PATCH',
-      headers: {
-        'Authorization': `token ${token}`,
-        'User-Agent': 'claude-agent',
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-        'Accept': 'application/vnd.github.v3+json'
-      }
-    };
-
-    const req = https.request(options, (res) => {
-      let responseBody = '';
-      res.on('data', chunk => responseBody += chunk);
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(JSON.parse(responseBody));
-        } else {
-          console.error(`[GitHub] Failed to update comment: ${res.statusCode} ${responseBody}`);
-          reject(new Error(`GitHub API error: ${res.statusCode} ${responseBody}`));
-        }
-      });
-    });
-
-    req.on('error', (error) => {
-      console.error(`[GitHub] Update request error: ${error.message}`);
-      reject(error);
-    });
-
-    req.write(data);
-    req.end();
-  });
-}
-
-// GitHub comment updater with debouncing
-class GitHubCommentUpdater {
+// Chronological comment poster - posts events as they happen in order
+class ChronologicalCommentPoster {
   constructor(owner, repo, prNumber, token) {
     this.owner = owner;
     this.repo = repo;
     this.prNumber = prNumber;
     this.token = token;
-    this.commentId = null;
-    this.pendingUpdate = null;
-    this.updateTimer = null;
-    this.thinkingContent = '';
-    this.toolUses = [];          // Array of {id, name, input, result}
-    this.toolUseById = {};       // Map id -> tool object for matching results
-    this.textBlocks = [];        // Collect text blocks, only show final summary
+    this.eventQueue = [];  // Chronological list of formatted event strings
+    this.toolUseById = {};  // Map id -> tool name for matching results
+    this.flushTimer = null;
     this.isComplete = false;
   }
 
-  async ensureComment() {
-    if (this.commentId) return;
+  // Add event to queue (maintains chronological order)
+  queueEvent(formatted) {
+    this.eventQueue.push(formatted);
 
-    const body = this.formatComment();
-    const result = await postGitHubComment(
-      this.owner, this.repo, this.prNumber, body, this.token
-    );
-    this.commentId = result.id;
-    console.log(`[GitHub] Created comment ${this.commentId}`);
+    // Flush immediately if queue is large
+    if (this.eventQueue.length >= MAX_EVENTS_PER_COMMENT) {
+      this.flush();
+    } else {
+      this.scheduleFlush();
+    }
   }
 
-  formatComment() {
-    let parts = ['## Claude Agent\n'];
-
-    // Add thinking section if present (collapsed)
-    if (this.thinkingContent) {
-      parts.push('<details>');
-      parts.push('<summary>Thinking...</summary>\n');
-      // Truncate thinking content
-      const truncatedThinking = this.thinkingContent.length > 3000
-        ? this.thinkingContent.substring(0, 3000) + '\n...(truncated)'
-        : this.thinkingContent;
-      parts.push(truncatedThinking);
-      parts.push('\n</details>\n');
-    }
-
-    // Show tool usage summary (collapsed)
-    if (this.toolUses.length > 0) {
-      parts.push('<details>');
-      parts.push(`<summary>Tool Activity (${this.toolUses.length} operations)</summary>\n`);
-
-      for (const tool of this.toolUses) {
-        parts.push(`**${tool.name}**`);
-        if (tool.input) {
-          const inputStr = typeof tool.input === 'string'
-            ? tool.input
-            : JSON.stringify(tool.input, null, 2);
-          // Truncate long inputs
-          const truncatedInput = inputStr.length > 300
-            ? inputStr.substring(0, 300) + '...'
-            : inputStr;
-          parts.push('```json');
-          parts.push(truncatedInput);
-          parts.push('```');
-        }
-        if (tool.result) {
-          // Truncate long results
-          const truncatedResult = tool.result.length > 500
-            ? tool.result.substring(0, 500) + '...(truncated)'
-            : tool.result;
-          parts.push('<details>');
-          parts.push('<summary>Result</summary>\n');
-          parts.push('```');
-          parts.push(truncatedResult);
-          parts.push('```');
-          parts.push('</details>');
-        }
-        parts.push('');
-      }
-      parts.push('</details>\n');
-    }
-
-    // Show only the final text block (the summary), not intermediate messages
-    const finalText = this.getFinalSummary();
-    if (finalText) {
-      parts.push(finalText);
-    }
-
-    // Add status indicator
-    if (!this.isComplete) {
-      parts.push('\n---\n*Processing...*');
-    }
-
-    parts.push('\n<!-- claude-agent -->');
-    return parts.join('\n');
+  scheduleFlush() {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flush();
+    }, FLUSH_INTERVAL_MS);
   }
 
-  // Extract final summary from text blocks
-  // Claude typically ends with a summary after "Here's a summary" or similar
-  getFinalSummary() {
-    if (this.textBlocks.length === 0) return '';
+  async flush() {
+    if (this.eventQueue.length === 0) return;
 
-    // Combine all text and look for the final summary section
-    const fullText = this.textBlocks.join('');
+    // Take all queued events
+    const events = this.eventQueue.splice(0);
 
-    // Try to find a summary section (usually starts with ## or "Here's" or "I have")
-    const summaryPatterns = [
-      /## Implementation Summary[\s\S]*/,
-      /## Summary[\s\S]*/,
-      /Here's a summary[\s\S]*/i,
-      /I have successfully[\s\S]*/i,
-      /The implementation[\s\S]*/i
-    ];
-
-    for (const pattern of summaryPatterns) {
-      const match = fullText.match(pattern);
-      if (match && match[0].length > 100) {
-        return match[0];
-      }
-    }
-
-    // Fallback: if text is short enough, show all; otherwise show last part
-    if (fullText.length < 1000) {
-      return fullText;
-    }
-
-    // Show last 1500 chars as likely contains summary
-    return '...\n\n' + fullText.slice(-1500);
-  }
-
-  scheduleUpdate() {
-    if (this.updateTimer) return;
-
-    this.updateTimer = setTimeout(async () => {
-      this.updateTimer = null;
-      await this.flushUpdate();
-    }, COMMENT_UPDATE_INTERVAL_MS);
-  }
-
-  async flushUpdate() {
-    if (!this.commentId) {
-      await this.ensureComment();
-      return;
-    }
+    // Format as single comment with events in order
+    const body = events.join('\n\n---\n\n') + '\n\n<!-- claude-agent -->';
 
     try {
-      const body = this.formatComment();
-      await updateGitHubComment(
-        this.owner, this.repo, this.commentId, body, this.token
-      );
+      await postGitHubComment(this.owner, this.repo, this.prNumber, body, this.token);
     } catch (error) {
-      console.error(`[GitHub] Failed to update comment: ${error.message}`);
+      console.error(`[GitHub] Failed to post: ${error.message}`);
     }
   }
 
   addThinking(content) {
-    this.thinkingContent += content;
-    this.scheduleUpdate();
+    if (!content.trim()) return;
+    const truncated = content.length > 2000
+      ? content.substring(0, 2000) + '...(truncated)'
+      : content;
+    this.queueEvent(`**💭 Thinking**\n${truncated}`);
   }
 
   addToolUse(id, name, input) {
-    const tool = { id, name, input, result: null };
-    this.toolUses.push(tool);
-    if (id) {
-      this.toolUseById[id] = tool;
-    }
-    this.scheduleUpdate();
+    this.toolUseById[id] = name;
+    const inputStr = typeof input === 'string' ? input : JSON.stringify(input, null, 2);
+    const truncated = inputStr.length > 500
+      ? inputStr.substring(0, 500) + '...'
+      : inputStr;
+    this.queueEvent(`**🔧 ${name}**\n\`\`\`json\n${truncated}\n\`\`\``);
   }
 
   addToolResult(toolUseId, result) {
-    // Match result to tool by ID
-    const tool = this.toolUseById[toolUseId];
-    if (tool) {
-      tool.result = result;
-    } else if (this.toolUses.length > 0) {
-      // Fallback: assign to most recent tool without result
-      for (let i = this.toolUses.length - 1; i >= 0; i--) {
-        if (!this.toolUses[i].result) {
-          this.toolUses[i].result = result;
-          break;
-        }
-      }
-    }
-    this.scheduleUpdate();
+    const toolName = this.toolUseById[toolUseId] || 'Tool';
+    const truncated = result.length > 1000
+      ? result.substring(0, 1000) + '...(truncated)'
+      : result;
+    this.queueEvent(`**✅ ${toolName} result**\n\`\`\`\n${truncated}\n\`\`\``);
   }
 
   addText(content) {
-    this.textBlocks.push(content);
-    this.scheduleUpdate();
+    if (!content.trim()) return;
+    this.queueEvent(content);
   }
 
   async complete() {
     this.isComplete = true;
-    if (this.updateTimer) {
-      clearTimeout(this.updateTimer);
-      this.updateTimer = null;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
     }
-    await this.flushUpdate();
+
+    // Add completion marker and flush
+    this.queueEvent('**✨ Claude agent completed**');
+    await this.flush();
   }
 }
 
@@ -440,10 +293,10 @@ function runClaudeStreaming(prompt, github) {
     // Close stdin immediately
     proc.stdin.end();
 
-    // Create GitHub comment updater if we have context
+    // Create chronological comment poster if we have GitHub context
     let updater = null;
     if (github && github.token && github.owner && github.repo && github.prNumber) {
-      updater = new GitHubCommentUpdater(
+      updater = new ChronologicalCommentPoster(
         github.owner, github.repo, github.prNumber, github.token
       );
     }
