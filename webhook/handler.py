@@ -1,863 +1,1075 @@
 """
-Webhook Handler for Claude Cloud Agent
-Handles GitHub and JIRA events for issue labeling, comments, and PR closure.
+Lambda webhook handler for GitHub events.
+
+Routes GitHub webhook events to appropriate handlers:
+- issues.labeled: Create branch/PR, start session
+- issue_comment.created: Route to running container
+- pull_request.closed: Stop session
 """
 
-import json
-import hmac
 import hashlib
+import hmac
+import json
+import logging
 import os
-import base64
-import requests
-from datetime import datetime
+from typing import Any
 
 import boto3
-from github import Github, GithubIntegration
 
-# AWS clients
-secrets = boto3.client('secretsmanager')
-dynamodb = boto3.resource('dynamodb')
-ecs = boto3.client('ecs')
+from github_client import GitHubClient
+from session_manager import SessionManager
+from ecs_launcher import ECSLauncher
 
-sessions_table = dynamodb.Table(os.environ.get('SESSION_TABLE', 'claude-cloud-agent-sessions'))
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
+# Environment variables
+GITHUB_APP_SECRET_ARN = os.environ.get("GITHUB_APP_SECRET_ARN")
+SESSIONS_TABLE = os.environ.get("SESSIONS_TABLE")
+UAT_DOMAIN_SUFFIX = os.environ.get("UAT_DOMAIN_SUFFIX", "uat.teammobot.dev")
+TEST_TICKETS_TASK_DEFINITION = os.environ.get("TEST_TICKETS_TASK_DEFINITION", "")
+TEST_TICKETS_SECRET_ARN = os.environ.get("TEST_TICKETS_SECRET_ARN", "")
+ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 
-def handler(event, context):
-    """Main webhook handler - routes GitHub and JIRA events."""
+# Trigger label that starts a session
+TRIGGER_LABEL = "claude-dev"
 
-    headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+# test_tickets UAT configuration
+TEST_TICKETS_TRIGGER_LABEL = "uat"
+TEST_TICKETS_CLAUDE_LABEL = "claude-dev"  # Auto-starts Claude to implement PR
+TEST_TICKETS_REPO = "team-mobot/test_tickets"
 
-    # Detect source and route accordingly
-    if 'x-atlassian-webhook-identifier' in headers:
-        return handle_jira_webhook(event)
-    elif 'x-github-event' in headers:
-        return handle_github_webhook(event)
-    else:
-        return {'statusCode': 400, 'body': 'Unknown webhook source'}
-
-
-# =============================================================================
-# GitHub Handlers
-# =============================================================================
-
-def handle_github_webhook(event):
-    """Handle GitHub webhook events."""
-
-    if not verify_github_signature(event):
-        return {'statusCode': 401, 'body': 'Invalid signature'}
-
-    body = json.loads(event['body'])
-    headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
-    event_type = headers.get('x-github-event', '').lower()
-
-    trigger_label = os.environ.get('TRIGGER_LABEL', 'claude-dev')
-
-    if event_type == 'issues' and body['action'] == 'labeled':
-        if body['label']['name'] == trigger_label:
-            return handle_github_new_issue(body['issue'], body['repository'])
-
-    elif event_type == 'issue_comment' and body['action'] == 'created':
-        return handle_github_comment(body)
-
-    elif event_type == 'pull_request' and body['action'] == 'closed':
-        return handle_pr_closed(body['pull_request'])
-
-    return {'statusCode': 200, 'body': 'OK'}
+# Lazy-loaded clients and secrets
+_secrets_client = None
+_github_app_secret = None
 
 
-def verify_github_signature(event) -> bool:
-    """Verify GitHub webhook signature."""
+def get_secrets_client():
+    """Get boto3 secrets manager client."""
+    global _secrets_client
+    if _secrets_client is None:
+        _secrets_client = boto3.client("secretsmanager")
+    return _secrets_client
 
-    headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
-    signature = headers.get('x-hub-signature-256', '')
 
-    if not signature:
+def get_github_app_secret() -> dict:
+    """Retrieve GitHub App secret from Secrets Manager (cached)."""
+    global _github_app_secret
+    if _github_app_secret is None:
+        client = get_secrets_client()
+        response = client.get_secret_value(SecretId=GITHUB_APP_SECRET_ARN)
+        _github_app_secret = json.loads(response["SecretString"])
+    return _github_app_secret
+
+
+def get_webhook_secret() -> str:
+    """Get webhook secret from combined GitHub App secret."""
+    return get_github_app_secret()["webhook_secret"]
+
+
+def get_github_private_key() -> str:
+    """Get private key from combined GitHub App secret."""
+    return get_github_app_secret()["private_key"]
+
+
+def get_github_app_id() -> str:
+    """Get App ID from combined GitHub App secret."""
+    return get_github_app_secret()["app_id"]
+
+
+def verify_signature(payload: bytes, signature: str) -> bool:
+    """
+    Verify GitHub webhook signature.
+
+    GitHub sends signature in format: sha256=<hex_digest>
+    """
+    if not signature or not signature.startswith("sha256="):
+        logger.warning("Invalid signature format")
         return False
 
-    secret_arn = os.environ.get('GITHUB_SECRET_ARN')
-    if not secret_arn:
-        return False
+    secret = get_webhook_secret()
+    expected_sig = "sha256=" + hmac.new(
+        secret.encode("utf-8"),
+        payload,
+        hashlib.sha256
+    ).hexdigest()
 
+    return hmac.compare_digest(expected_sig, signature)
+
+
+def is_bot_comment(author: str, body: str) -> bool:
+    """
+    Detect bot comments to prevent infinite loops.
+
+    Returns True if:
+    - Author username ends with [bot]
+    - Comment body contains our agent marker
+    """
+    if author.endswith("[bot]"):
+        return True
+    if "<!-- claude-agent -->" in body:
+        return True
+    return False
+
+
+def lambda_handler(event: dict, context: Any) -> dict:
+    """
+    Main Lambda handler for GitHub webhooks.
+    """
+    logger.info(f"Received event: {json.dumps(event)[:500]}...")
+
+    # Extract headers and body
+    headers = event.get("headers", {})
+    body = event.get("body", "")
+
+    # Handle base64 encoding
+    if event.get("isBase64Encoded"):
+        import base64
+        body = base64.b64decode(body).decode("utf-8")
+
+    # Verify webhook signature
+    signature = headers.get("x-hub-signature-256", "")
+    if not verify_signature(body.encode("utf-8"), signature):
+        logger.error("Webhook signature verification failed")
+        return {
+            "statusCode": 401,
+            "body": json.dumps({"error": "Invalid signature"})
+        }
+
+    # Parse event
     try:
-        secret = secrets.get_secret_value(SecretId=secret_arn)
-        creds = json.loads(secret['SecretString'])
-        webhook_secret = creds.get('webhook_secret', '')
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse webhook payload: {e}")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"error": "Invalid JSON"})
+        }
 
-        body = event.get('body', '')
+    # Get event type
+    event_type = headers.get("x-github-event", "")
+    action = payload.get("action", "")
 
-        if event.get('isBase64Encoded'):
-            body = base64.b64decode(body).decode('utf-8')
+    logger.info(f"Processing {event_type}.{action}")
 
-        expected = 'sha256=' + hmac.new(
-            webhook_secret.encode(),
-            body.encode(),
-            hashlib.sha256
-        ).hexdigest()
+    # Initialize clients
+    installation_id = payload.get("installation", {}).get("id")
+    if not installation_id:
+        logger.error("No installation ID in payload")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"error": "Missing installation ID"})
+        }
 
-        return hmac.compare_digest(signature, expected)
+    github = GitHubClient(
+        app_id=get_github_app_id(),
+        private_key=get_github_private_key(),
+        installation_id=installation_id
+    )
+    sessions = SessionManager(table_name=SESSIONS_TABLE)
+    ecs = ECSLauncher()
+
+    # Route to appropriate handler
+    try:
+        if event_type == "issues" and action == "labeled":
+            return handle_issue_labeled(payload, github, sessions, ecs)
+        elif event_type == "issues" and action in ("unlabeled", "closed"):
+            return handle_issue_unlabeled_or_closed(payload, github, sessions, ecs)
+        elif event_type == "issue_comment" and action == "created":
+            return handle_issue_comment(payload, github, sessions)
+        elif event_type == "pull_request" and action == "labeled":
+            return handle_pr_labeled(payload, github, sessions, ecs)
+        elif event_type == "pull_request" and action in ("unlabeled", "closed"):
+            return handle_pr_unlabeled_or_closed(payload, github, sessions, ecs)
+        else:
+            logger.info(f"Ignoring event: {event_type}.{action}")
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "Event ignored"})
+            }
     except Exception as e:
-        print(f"Error in verify_github_signature: {e}")
-        return False
+        logger.exception(f"Error handling {event_type}.{action}: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
 
 
-def get_github_client():
-    """Get authenticated GitHub client."""
+def handle_issue_labeled(
+    payload: dict,
+    github: GitHubClient,
+    sessions: SessionManager,
+    ecs: ECSLauncher
+) -> dict:
+    """
+    Handle issue labeled event.
 
-    secret_arn = os.environ.get('GITHUB_SECRET_ARN')
-    secret = secrets.get_secret_value(SecretId=secret_arn)
-    creds = json.loads(secret['SecretString'])
+    When an issue is labeled with TRIGGER_LABEL:
+    1. Create a feature branch
+    2. Create a draft PR
+    3. Create session in DynamoDB
+    4. Launch ECS task
 
-    integration = GithubIntegration(
-        creds['app_id'],
-        creds['private_key']
+    When test_tickets repo is labeled with 'uat':
+    1. Start UAT environment for the branch
+    """
+    issue = payload.get("issue", {})
+    label = payload.get("label", {})
+    repo = payload.get("repository", {})
+    label_name = label.get("name", "")
+    repo_full_name = repo.get("full_name", "")
+
+    # Check for test_tickets UAT trigger
+    if (
+        repo_full_name == TEST_TICKETS_REPO
+        and label_name == TEST_TICKETS_TRIGGER_LABEL
+        and TEST_TICKETS_TASK_DEFINITION
+    ):
+        return handle_test_tickets_uat(payload, github, sessions, ecs)
+
+    # Check if this is our trigger label
+    if label_name != TRIGGER_LABEL:
+        logger.info(f"Ignoring label: {label.get('name')}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Not trigger label"})
+        }
+
+    issue_number = issue.get("number")
+    issue_title = issue.get("title", "")
+    issue_body = issue.get("body", "")
+    repo_clone_url = repo.get("clone_url")
+    default_branch = repo.get("default_branch", "main")
+
+    logger.info(f"Starting session for issue #{issue_number} in {repo_full_name}")
+
+    # Check for existing session
+    existing = sessions.get_session_by_pr(repo_full_name, issue_number)
+    if existing and existing.get("status") in ("STARTING", "RUNNING"):
+        logger.info(f"Session already exists: {existing['session_id']}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Session already exists",
+                "session_id": existing["session_id"]
+            })
+        }
+
+    # Create branch name
+    branch_name = f"claude/{issue_number}"
+
+    # Create branch from default branch
+    logger.info(f"Creating branch {branch_name} from {default_branch}")
+    github.create_branch(repo_full_name, branch_name, default_branch)
+
+    # Create initial commit (required for PR creation - branch must differ from base)
+    import uuid
+    session_id = str(uuid.uuid4())[:8]
+    session_file_content = f"""# Claude Agent Session
+
+Session ID: {session_id}
+Issue: #{issue_number}
+Repository: {repo_full_name}
+Created: {__import__('datetime').datetime.utcnow().isoformat()}Z
+
+This file tracks the Claude Cloud Agent session working on this branch.
+"""
+    logger.info(f"Creating initial commit on {branch_name}")
+    github.create_or_update_file(
+        repo_full_name,
+        ".claude-session",
+        f"chore: initialize Claude agent session for issue #{issue_number}",
+        session_file_content,
+        branch_name
     )
-    installation = integration.get_installations()[0]
-    return installation.get_github_for_installation()
 
+    # Create draft PR
+    pr_title = f"[Claude] {issue_title}"
+    pr_body = f"""## Automated Implementation
 
-def handle_github_new_issue(issue: dict, repo: dict):
-    """Start new dev session from GitHub issue."""
+This PR was created by Claude Cloud Agent to implement issue #{issue_number}.
 
-    gh = get_github_client()
-    repository = gh.get_repo(repo['full_name'])
-    issue_number = issue['number']
-    session_id = f"github-issue-{repo['full_name'].replace('/', '-')}-{issue_number}"
-    branch_name = f"claude-dev/issue-{issue_number}"
+### Original Issue
+{issue_body}
 
-    # 1. Create branch
-    base = repository.get_branch('main')
-    repository.create_git_ref(
-        ref=f"refs/heads/{branch_name}",
-        sha=base.commit.sha
-    )
-
-    # 2. Create initial commit with session info
-    session_content = f"""# Claude Cloud Agent Session
-
-**Issue:** #{issue_number}
-**Title:** {issue['title']}
-**Started:** {datetime.utcnow().isoformat()}Z
-
-## Original Request
-
-{issue['body'] or issue['title']}
+### UAT Preview
+URL will be posted when the agent is ready.
 
 ---
-*This file tracks the Claude Cloud Agent session. Progress updates will be added as comments on the PR.*
-"""
-    repository.create_file(
-        path=".claude-dev/session.md",
-        message=f"Start Claude Cloud Agent session for issue #{issue_number}",
-        content=session_content,
-        branch=branch_name
-    )
+*This PR is being worked on by an automated agent. Comment on this PR to provide feedback.*
 
-    # 3. Create draft PR
-    pr = repository.create_pull(
-        title=f"[Claude Dev] {issue['title']}",
-        body=format_github_pr_description(issue),
+<!-- claude-agent -->
+"""
+
+    logger.info(f"Creating draft PR: {pr_title}")
+    pr = github.create_pull_request(
+        repo_full_name,
+        title=pr_title,
+        body=pr_body,
         head=branch_name,
-        base='main',
+        base=default_branch,
         draft=True
     )
+    pr_number = pr["number"]
 
-    # 4. Store session
-    sessions_table.put_item(Item={
-        'session_id': session_id,
-        'source': 'github',
-        'pr_number': pr.number,
-        'branch': branch_name,
-        'repo': repo['full_name'],
-        'status': 'starting',
-        'created_at': datetime.utcnow().isoformat()
-    })
-
-    # 5. Close issue with link to PR
-    issue_obj = repository.get_issue(issue_number)
-    issue_obj.create_comment(
-        f"**Development session started!**\n\n"
-        f"All work will be tracked in PR #{pr.number}.\n\n"
-        f"Please provide feedback and interact there."
-    )
-    issue_obj.edit(state='closed')
-
-    # 6. Start agent task
-    task_info = start_agent_task(
+    # Create session record (session_id was generated earlier for the initial commit)
+    logger.info(f"Creating session {session_id}")
+    sessions.create_session(
         session_id=session_id,
-        pr_number=pr.number,
-        branch=branch_name,
-        prompt=issue['body'] or issue['title'],
-        repo=repo['full_name'],
-        source='github'
-    )
-
-    # 7. Post UAT info to PR
-    if task_info:
-        pr.create_issue_comment(
-            f"**UAT Access**\n\n"
-            f"Connect to the running container:\n"
-            f"```bash\n{task_info['uat_command']}\n```\n\n"
-            f"*Requires AWS CLI and Session Manager plugin*"
-        )
-
-    return {'statusCode': 200, 'body': f'Started session {session_id}'}
-
-
-def handle_github_comment(body: dict):
-    """Handle user comment on PR - continue session."""
-
-    if not body.get('issue', {}).get('pull_request'):
-        return {'statusCode': 200, 'body': 'Not a PR comment'}
-
-    pr_number = body['issue']['number']
-    comment = body['comment']
-    comment_text = comment.get('body', '')
-
-    # Skip bot's own comments - check username and content signatures
-    is_bot_comment = (
-        comment['user']['login'].endswith('[bot]') or
-        '**Claude Cloud Agent' in comment_text or
-        '💬 **Claude:**' in comment_text or
-        '📖 **Reading file:**' in comment_text or
-        '💻 **Running:**' in comment_text or
-        '✅ **Result:**' in comment_text or
-        '❌ **Error:**' in comment_text or
-        '**UAT Access**' in comment_text
-    )
-
-    if is_bot_comment:
-        return {'statusCode': 200, 'body': 'Bot comment, ignoring'}
-
-    # Find session
-    response = sessions_table.query(
-        IndexName='pr-index',
-        KeyConditionExpression='pr_number = :pr',
-        ExpressionAttributeValues={':pr': pr_number}
-    )
-
-    if not response['Items']:
-        return {'statusCode': 200, 'body': 'No session found'}
-
-    session = response['Items'][0]
-
-    # Skip if session is already running (prevent duplicate tasks)
-    if session.get('status') == 'running':
-        print(f"Session {session['session_id']} already running, skipping")
-        return {'statusCode': 200, 'body': 'Session already running'}
-
-    # Resume agent with user's comment as new instruction
-    start_agent_task(
-        session_id=session['session_id'],
+        repo_full_name=repo_full_name,
+        issue_number=issue_number,
         pr_number=pr_number,
-        branch=session['branch'],
-        prompt=comment['body'],
-        repo=body['repository']['full_name'],
-        source=session.get('source', 'github'),
-        jira_issue_key=session.get('jira_issue_key'),
-        jira_site=session.get('jira_site'),
-        resume=True
+        branch_name=branch_name
     )
 
-    return {'statusCode': 200, 'body': 'Session resumed'}
-
-
-def handle_pr_closed(pr: dict):
-    """Clean up when PR is merged or closed."""
-
-    pr_number = pr['number']
-
-    # Find session
-    response = sessions_table.query(
-        IndexName='pr-index',
-        KeyConditionExpression='pr_number = :pr',
-        ExpressionAttributeValues={':pr': pr_number}
+    # Launch ECS task with GitHub token for cloning
+    logger.info(f"Launching ECS task for session {session_id}")
+    task_arn = ecs.launch_agent_task(
+        session_id=session_id,
+        repo_clone_url=repo_clone_url,
+        branch_name=branch_name,
+        issue_number=issue_number,
+        pr_number=pr_number,
+        initial_prompt=f"Issue #{issue_number}: {issue_title}\n\n{issue_body}",
+        github_token=github.get_token(),
+        installation_id=payload.get("installation", {}).get("id", 0),
+        repo_full_name=repo_full_name
     )
 
-    if not response['Items']:
-        return {'statusCode': 200, 'body': 'No session found'}
+    # Update session with task ARN
+    sessions.update_session(session_id, task_arn=task_arn)
 
-    session = response['Items'][0]
-
-    # Stop agent task if running
-    if session.get('agent_task_arn'):
-        try:
-            ecs.stop_task(
-                cluster=os.environ.get('ECS_CLUSTER', 'claude-cloud-agent'),
-                task=session['agent_task_arn'],
-                reason='PR closed'
-            )
-        except Exception as e:
-            print(f"Error stopping task: {e}")
-
-    # Update session status
-    status = 'completed' if pr.get('merged') else 'closed'
-    sessions_table.update_item(
-        Key={'session_id': session['session_id']},
-        UpdateExpression='SET #status = :status, completed_at = :time',
-        ExpressionAttributeNames={'#status': 'status'},
-        ExpressionAttributeValues={
-            ':status': status,
-            ':time': datetime.utcnow().isoformat()
-        }
-    )
-
-    # Post final comment to GitHub PR
-    gh = get_github_client()
-    repo = gh.get_repo(pr['base']['repo']['full_name'])
-    pr_obj = repo.get_pull(pr_number)
-
-    status_text = "merged" if pr.get('merged') else "closed"
-    pr_obj.create_issue_comment(
-        f"**Session Complete**\n\n"
-        f"PR {status_text}. Agent session ended.\n\n"
-        f"Session ID: `{session['session_id']}`"
-    )
-
-    # If JIRA-sourced, post completion to JIRA
-    if session.get('source') == 'jira' and session.get('jira_issue_key'):
-        try:
-            jira_creds = get_jira_credentials()
-            post_jira_comment(
-                jira_creds,
-                session['jira_issue_key'],
-                f"**Claude Cloud Agent Session Complete**\n\n"
-                f"PR {status_text}. See PR for full details.\n\n"
-                f"Session ID: `{session['session_id']}`"
-            )
-        except Exception as e:
-            print(f"Error posting JIRA completion comment: {e}")
-
-    return {'statusCode': 200, 'body': 'Session cleaned up'}
-
-
-def format_github_pr_description(issue: dict, jira_issue_key: str = None) -> str:
-    """Format PR description from GitHub issue."""
-
-    jira_link = ""
-    if jira_issue_key:
-        jira_link = f"\n**JIRA:** {jira_issue_key}\n"
-
-    return f"""## Claude Cloud Agent Session
-
-This PR was automatically created from issue #{issue['number']}.
-{jira_link}
-### Original Request
-
-{issue['body'] or issue['title']}
-
----
-
-**Session ID:** `github-issue-{issue['number']}`
-
-All development work is logged below as comments.
-"""
-
-
-# =============================================================================
-# JIRA Handlers
-# =============================================================================
-
-def handle_jira_webhook(event):
-    """Handle JIRA webhook events."""
-
-    if not verify_jira_signature(event):
-        return {'statusCode': 401, 'body': 'Invalid JIRA signature'}
-
-    body = json.loads(event['body'])
-    webhook_event = body.get('webhookEvent', '')
-
-    print(f"JIRA webhook event: {webhook_event}")
-
-    trigger_label = os.environ.get('TRIGGER_LABEL', 'claude-dev')
-
-    # Issue updated - check for label addition
-    if webhook_event == 'jira:issue_updated':
-        changelog = body.get('changelog', {})
-        for item in changelog.get('items', []):
-            if item.get('field') == 'labels':
-                # Check if trigger label was added
-                from_labels = set((item.get('fromString') or '').split())
-                to_labels = set((item.get('toString') or '').split())
-                added_labels = to_labels - from_labels
-
-                if trigger_label in added_labels:
-                    return handle_jira_labeled(body['issue'], body)
-
-    # Issue comment created
-    elif webhook_event == 'comment_created':
-        return handle_jira_comment(body)
-
-    return {'statusCode': 200, 'body': 'OK'}
-
-
-def verify_jira_signature(event) -> bool:
-    """Verify JIRA webhook signature (if configured)."""
-
-    # JIRA Cloud webhooks don't have built-in HMAC signatures like GitHub
-    # Authentication is typically done via:
-    # 1. IP allowlisting (Atlassian IPs)
-    # 2. Shared secret in custom header
-    # 3. JWT for Atlassian Connect apps
-
-    # For now, check for custom shared secret header if configured
-    secret_arn = os.environ.get('JIRA_SECRET_ARN')
-    if not secret_arn:
-        print("Warning: No JIRA_SECRET_ARN configured, skipping signature verification")
-        return True
-
-    try:
-        secret = secrets.get_secret_value(SecretId=secret_arn)
-        creds = json.loads(secret['SecretString'])
-        webhook_secret = creds.get('webhook_secret')
-
-        if not webhook_secret:
-            print("Warning: No webhook_secret in JIRA credentials, skipping verification")
-            return True
-
-        headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
-
-        # Check for custom auth header
-        provided_secret = headers.get('x-webhook-secret', '')
-        if provided_secret and hmac.compare_digest(provided_secret, webhook_secret):
-            return True
-
-        # If no header but secret configured, log warning but allow (for dev)
-        print("Warning: JIRA webhook secret configured but not provided in request")
-        return True
-
-    except Exception as e:
-        print(f"Error in verify_jira_signature: {e}")
-        return False
-
-
-def get_jira_credentials() -> dict:
-    """Get JIRA credentials from Secrets Manager."""
-
-    secret_arn = os.environ.get('JIRA_SECRET_ARN')
-    if not secret_arn:
-        raise ValueError("JIRA_SECRET_ARN not configured")
-
-    secret = secrets.get_secret_value(SecretId=secret_arn)
-    return json.loads(secret['SecretString'])
-
-
-def get_jira_issue(creds: dict, issue_key: str) -> dict:
-    """Fetch JIRA issue details."""
-
-    site = creds['site']
-    email = creds['email']
-    api_token = creds['api_token']
-
-    response = requests.get(
-        f"https://{site}/rest/api/3/issue/{issue_key}",
-        auth=(email, api_token),
-        headers={'Accept': 'application/json'}
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def post_jira_comment(creds: dict, issue_key: str, body_text: str):
-    """Post a comment to a JIRA issue."""
-
-    site = creds['site']
-    email = creds['email']
-    api_token = creds['api_token']
-
-    # JIRA Cloud API v3 uses Atlassian Document Format (ADF)
-    adf_body = {
-        "body": {
-            "type": "doc",
-            "version": 1,
-            "content": [
-                {
-                    "type": "paragraph",
-                    "content": [
-                        {"type": "text", "text": body_text}
-                    ]
-                }
-            ]
-        }
+    logger.info(f"Session {session_id} started successfully")
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "Session started",
+            "session_id": session_id,
+            "pr_number": pr_number,
+            "task_arn": task_arn
+        })
     }
 
-    response = requests.post(
-        f"https://{site}/rest/api/3/issue/{issue_key}/comment",
-        auth=(email, api_token),
-        headers={
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        },
-        json=adf_body
-    )
-    response.raise_for_status()
-    return response.json()
 
+def handle_issue_comment(
+    payload: dict,
+    github: GitHubClient,
+    sessions: SessionManager
+) -> dict:
+    """
+    Handle PR comment event.
 
-def handle_jira_labeled(issue: dict, webhook_data: dict):
-    """Start new dev session from JIRA issue."""
+    Routes comments to running containers via their prompt API.
+    """
+    comment = payload.get("comment", {})
+    issue = payload.get("issue", {})
+    repo = payload.get("repository", {})
 
-    issue_key = issue['key']
-    fields = issue.get('fields', {})
+    # Only handle PR comments (issues with pull_request key)
+    if "pull_request" not in issue:
+        logger.info("Comment is on issue, not PR - ignoring")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Not a PR comment"})
+        }
 
-    # Get JIRA credentials
-    jira_creds = get_jira_credentials()
-    jira_site = jira_creds['site']
+    comment_author = comment.get("user", {}).get("login", "")
+    comment_body = comment.get("body", "")
+    pr_number = issue.get("number")
+    repo_full_name = repo.get("full_name")
 
-    # Get target repo from custom field
-    repo_field_id = jira_creds.get('repo_custom_field_id', 'customfield_10001')
-    target_repo = fields.get(repo_field_id)
+    # Check for bot comment
+    if is_bot_comment(comment_author, comment_body):
+        logger.info(f"Ignoring bot comment from {comment_author}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Bot comment ignored"})
+        }
 
-    if not target_repo:
-        print(f"No target repo specified in custom field {repo_field_id}")
-        post_jira_comment(
-            jira_creds,
-            issue_key,
-            f"**Claude Cloud Agent Error**\n\n"
-            f"No GitHub repository specified. Please set the repository custom field and try again."
-        )
-        return {'statusCode': 400, 'body': 'No target repo specified'}
+    # Look up session
+    session = sessions.get_session_by_pr(repo_full_name, pr_number)
+    if not session:
+        logger.info(f"No session found for PR #{pr_number}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "No active session"})
+        }
 
-    # Clean up repo name (might be full URL or owner/repo format)
-    if 'github.com/' in target_repo:
-        target_repo = target_repo.split('github.com/')[-1].rstrip('/')
-    target_repo = target_repo.strip()
+    if session.get("status") != "RUNNING":
+        logger.info(f"Session {session['session_id']} not running: {session.get('status')}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Session not running"})
+        }
 
-    print(f"JIRA issue {issue_key} targeting repo: {target_repo}")
+    container_ip = session.get("container_ip")
+    if not container_ip:
+        logger.warning(f"Session {session['session_id']} has no container IP")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Container not ready"})
+        }
 
-    # Get GitHub client and validate repo access
-    gh = get_github_client()
+    # Forward comment to container with GitHub context for posting responses
+    import requests
     try:
-        repository = gh.get_repo(target_repo)
+        prompt_url = f"http://{container_ip}:8080/prompt"
+        logger.info(f"Forwarding comment to {prompt_url}")
+
+        # Parse owner/repo from full_name
+        owner, repo_name = repo_full_name.split("/", 1)
+
+        response = requests.post(
+            prompt_url,
+            json={
+                "prompt": comment_body,
+                "github": {
+                    "owner": owner,
+                    "repo": repo_name,
+                    "prNumber": pr_number,
+                    "token": github.get_token()
+                }
+            },
+            timeout=30  # Prompt server should return quickly after accepting
+        )
+        response.raise_for_status()
+
+        logger.info(f"Comment forwarded successfully")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Comment forwarded",
+                "session_id": session["session_id"]
+            })
+        }
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to forward comment: {e}")
+        # Don't mark session as failed - just log the error
+        # The container might still be processing or temporarily unavailable
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": f"Failed to forward: {e}"})
+        }
+
+
+def handle_pr_closed(
+    payload: dict,
+    github: GitHubClient,
+    sessions: SessionManager,
+    ecs: ECSLauncher
+) -> dict:
+    """
+    Handle PR closed event.
+
+    Stops the ECS task and marks session as completed.
+    """
+    pr = payload.get("pull_request", {})
+    repo = payload.get("repository", {})
+
+    pr_number = pr.get("number")
+    repo_full_name = repo.get("full_name")
+    merged = pr.get("merged", False)
+
+    # Look up session
+    session = sessions.get_session_by_pr(repo_full_name, pr_number)
+    if not session:
+        logger.info(f"No session found for PR #{pr_number}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "No session to clean up"})
+        }
+
+    session_id = session["session_id"]
+    task_arn = session.get("task_arn")
+
+    logger.info(f"Closing session {session_id} (merged={merged})")
+
+    # Stop ECS task if running
+    if task_arn and session.get("status") in ("STARTING", "RUNNING"):
+        try:
+            ecs.stop_task(task_arn)
+            logger.info(f"Stopped task {task_arn}")
+        except Exception as e:
+            logger.error(f"Failed to stop task: {e}")
+
+    # Update session status
+    status = "COMPLETED" if merged else "COMPLETED"
+    sessions.update_session(session_id, status=status)
+
+    logger.info(f"Session {session_id} marked as {status}")
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "Session closed",
+            "session_id": session_id,
+            "merged": merged
+        })
+    }
+
+
+def cleanup_uat_resources(session: dict) -> None:
+    """
+    Clean up ALB target group and listener rule for a UAT session.
+
+    Args:
+        session: Session dict from DynamoDB containing target_group_arn
+    """
+    target_group_arn = session.get("target_group_arn")
+    session_id = session.get("session_id", "")
+
+    if not target_group_arn:
+        logger.info(f"No target group ARN for session {session_id}, skipping cleanup")
+        return
+
+    # Skip cleanup for shared target group
+    if "test-tickets-uat-tg" in target_group_arn:
+        logger.info(f"Session {session_id} uses shared target group, skipping cleanup")
+        return
+
+    elbv2 = boto3.client("elbv2")
+
+    try:
+        # Find and delete ALB listener rules pointing to this target group
+        if ALB_LISTENER_ARN:
+            rules = elbv2.describe_rules(ListenerArn=ALB_LISTENER_ARN)
+            for rule in rules.get("Rules", []):
+                if rule.get("IsDefault"):
+                    continue
+                actions = rule.get("Actions", [])
+                for action in actions:
+                    if action.get("TargetGroupArn") == target_group_arn:
+                        rule_arn = rule.get("RuleArn")
+                        logger.info(f"Deleting ALB rule {rule_arn}")
+                        elbv2.delete_rule(RuleArn=rule_arn)
+                        break
+
+        # Delete target group
+        logger.info(f"Deleting target group {target_group_arn}")
+        elbv2.delete_target_group(TargetGroupArn=target_group_arn)
+        logger.info(f"Cleaned up UAT resources for session {session_id}")
+
     except Exception as e:
-        print(f"Cannot access repo {target_repo}: {e}")
-        post_jira_comment(
-            jira_creds,
-            issue_key,
-            f"**Claude Cloud Agent Error**\n\n"
-            f"Cannot access GitHub repository `{target_repo}`. "
-            f"Please verify the repository name and permissions."
-        )
-        return {'statusCode': 400, 'body': f'Cannot access repo: {target_repo}'}
+        logger.error(f"Error cleaning up UAT resources for {session_id}: {e}")
 
-    # Create session
-    session_id = f"jira-{issue_key}"
-    branch_name = f"claude-dev/{issue_key}"
-    issue_summary = fields.get('summary', issue_key)
-    issue_description = fields.get('description', issue_summary)
 
-    # Convert ADF description to plain text if needed
-    if isinstance(issue_description, dict):
-        issue_description = extract_text_from_adf(issue_description)
+def handle_issue_unlabeled_or_closed(
+    payload: dict,
+    github: GitHubClient,
+    sessions: SessionManager,
+    ecs: ECSLauncher
+) -> dict:
+    """
+    Handle issue unlabeled or closed event.
 
-    # 1. Create branch
+    Stops UAT environment when 'uat' label is removed or issue is closed.
+    """
+    issue = payload.get("issue", {})
+    repo = payload.get("repository", {})
+    action = payload.get("action")
+    label = payload.get("label", {})
+
+    issue_number = issue.get("number")
+    repo_full_name = repo.get("full_name")
+
+    # Only handle test_tickets repo
+    if repo_full_name != TEST_TICKETS_REPO:
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Not test_tickets repo"})
+        }
+
+    # For unlabeled events, only handle 'uat' label removal
+    if action == "unlabeled" and label.get("name") != TEST_TICKETS_TRIGGER_LABEL:
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Not uat label"})
+        }
+
+    # Look up session by issue number
+    session = sessions.get_session_by_pr(repo_full_name, issue_number)
+    if not session:
+        logger.info(f"No UAT session found for issue #{issue_number}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "No session to clean up"})
+        }
+
+    session_id = session["session_id"]
+    task_arn = session.get("task_arn")
+
+    logger.info(f"Stopping UAT session {session_id} (action={action})")
+
+    # Stop ECS task if running
+    if task_arn and session.get("status") in ("STARTING", "RUNNING"):
+        try:
+            ecs.stop_task(task_arn, reason=f"Issue {action}")
+            logger.info(f"Stopped task {task_arn}")
+        except Exception as e:
+            logger.error(f"Failed to stop task: {e}")
+
+    # Clean up ALB resources
+    cleanup_uat_resources(session)
+
+    # Update session status
+    sessions.update_session(session_id, status="STOPPED")
+
+    # Post comment to issue
     try:
-        base = repository.get_branch('main')
-    except:
-        base = repository.get_branch(repository.default_branch)
+        issue_obj = github.get_issue(repo_full_name, issue_number)
+        issue_obj.create_comment(
+            f"<!-- claude-agent -->\n**UAT Environment Stopped**\n\n"
+            f"The UAT environment for `{session_id}` has been shut down."
+        )
+    except Exception as e:
+        logger.error(f"Failed to post comment: {e}")
 
-    repository.create_git_ref(
-        ref=f"refs/heads/{branch_name}",
-        sha=base.commit.sha
-    )
+    logger.info(f"UAT session {session_id} stopped")
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "UAT session stopped",
+            "session_id": session_id
+        })
+    }
 
-    # 2. Create initial commit with session info
-    session_content = f"""# Claude Cloud Agent Session
 
-**JIRA Issue:** [{issue_key}](https://{jira_site}/browse/{issue_key})
-**Title:** {issue_summary}
-**Started:** {datetime.utcnow().isoformat()}Z
+def handle_test_tickets_uat(
+    payload: dict,
+    github: GitHubClient,
+    sessions: SessionManager,
+    ecs: ECSLauncher
+) -> dict:
+    """
+    Handle test_tickets UAT deployment.
 
-## Original Request
+    When an issue in test_tickets is labeled with 'uat':
+    1. Parse branch name from issue (or use issue number)
+    2. Create unique session ID
+    3. Launch test_tickets ECS task with PostgreSQL
+    4. Post UAT URL to issue
+    """
+    import uuid
+    from datetime import datetime
 
-{issue_description}
+    issue = payload.get("issue", {})
+    repo = payload.get("repository", {})
 
----
-*This file tracks the Claude Cloud Agent session. Progress updates will be added as comments on both the PR and JIRA issue.*
-"""
-    repository.create_file(
-        path=".claude-dev/session.md",
-        message=f"Start Claude Cloud Agent session for {issue_key}",
-        content=session_content,
-        branch=branch_name
-    )
+    issue_number = issue.get("number")
+    issue_title = issue.get("title", "")
+    issue_body = issue.get("body", "") or ""
+    repo_full_name = repo.get("full_name")
 
-    # 3. Create draft PR
-    pr = repository.create_pull(
-        title=f"[Claude Dev] {issue_key}: {issue_summary}",
-        body=format_jira_pr_description(issue_key, issue_summary, issue_description, jira_site),
-        head=branch_name,
-        base='main',
-        draft=True
-    )
+    logger.info(f"Starting test_tickets UAT for issue #{issue_number} in {repo_full_name}")
 
-    # 4. Store session
-    sessions_table.put_item(Item={
-        'session_id': session_id,
-        'source': 'jira',
-        'jira_issue_key': issue_key,
-        'jira_site': jira_site,
-        'pr_number': pr.number,
-        'branch': branch_name,
-        'repo': target_repo,
-        'status': 'starting',
-        'created_at': datetime.utcnow().isoformat()
-    })
+    # Parse branch name from issue body or title
+    # Look for patterns like "branch: feature/xyz" or use issue number
+    branch_name = None
+    for line in issue_body.split("\n"):
+        line_lower = line.lower().strip()
+        if line_lower.startswith("branch:"):
+            branch_name = line.split(":", 1)[1].strip()
+            break
 
-    # 5. Start agent task
-    task_info = start_agent_task(
+    if not branch_name:
+        # Default to issue number based branch
+        branch_name = f"feature/issue-{issue_number}"
+
+    # Create session ID (sanitize branch name for subdomain)
+    safe_branch = branch_name.replace("/", "-").replace("_", "-").lower()
+    session_id = f"tt-{safe_branch}"[:50]  # Limit length for subdomain
+
+    # Check for existing session
+    existing = sessions.get_session(session_id)
+    if existing and existing.get("status") in ("STARTING", "RUNNING"):
+        uat_url = f"https://{session_id}.{UAT_DOMAIN_SUFFIX}"
+        logger.info(f"UAT session already exists: {session_id}")
+
+        # Post reminder comment
+        github.create_issue_comment(
+            repo_full_name,
+            issue_number,
+            f"<!-- claude-agent -->\n**UAT Already Running**\n\n"
+            f"URL: {uat_url}\n\n"
+            f"Session: `{session_id}`"
+        )
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "UAT session already exists",
+                "session_id": session_id,
+                "uat_url": uat_url
+            })
+        }
+
+    # Create session record
+    logger.info(f"Creating test_tickets UAT session {session_id}")
+    sessions.create_session(
         session_id=session_id,
-        pr_number=pr.number,
-        branch=branch_name,
-        prompt=f"JIRA Issue {issue_key}: {issue_summary}\n\n{issue_description}",
-        repo=target_repo,
-        source='jira',
-        jira_issue_key=issue_key,
-        jira_site=jira_site
+        repo_full_name=repo_full_name,
+        issue_number=issue_number,
+        pr_number=issue_number,  # Use issue number as PR number for lookups
+        branch_name=branch_name
     )
 
-    # 6. Post comment to JIRA with PR link and UAT info
-    uat_info = ""
-    if task_info:
-        uat_info = (
-            f"\n\n**UAT Access**\n"
-            f"Connect to the running container:\n"
-            f"```\n{task_info['uat_command']}\n```"
-        )
-
-    post_jira_comment(
-        jira_creds,
-        issue_key,
-        f"**Claude Cloud Agent Started**\n\n"
-        f"Development session started! Working in GitHub:\n\n"
-        f"- Repository: {target_repo}\n"
-        f"- Branch: {branch_name}\n"
-        f"- Pull Request: https://github.com/{target_repo}/pull/{pr.number}\n\n"
-        f"Progress updates will be posted here and on the PR."
-        f"{uat_info}"
-    )
-
-    # Also post UAT info to GitHub PR
-    if task_info:
-        pr.create_issue_comment(
-            f"**UAT Access**\n\n"
-            f"Connect to the running container:\n"
-            f"```bash\n{task_info['uat_command']}\n```\n\n"
-            f"*Requires AWS CLI and Session Manager plugin*"
-        )
-
-    return {'statusCode': 200, 'body': f'Started session {session_id}'}
-
-
-def handle_jira_comment(webhook_data: dict):
-    """Handle user comment on JIRA issue - continue session if exists."""
-
-    comment = webhook_data.get('comment', {})
-    issue = webhook_data.get('issue', {})
-    issue_key = issue.get('key')
-
-    if not issue_key:
-        return {'statusCode': 200, 'body': 'No issue key found'}
-
-    # Skip bot's own comments (check for automation user or specific text)
-    author = comment.get('author', {})
-
-    # Extract text from ADF body for bot detection
-    comment_body_raw = comment.get('body', '')
-    if isinstance(comment_body_raw, dict):
-        comment_text = extract_text_from_adf(comment_body_raw)
-    else:
-        comment_text = str(comment_body_raw)
-
-    # Skip if posted by app or contains bot signatures
-    is_bot_comment = (
-        author.get('accountType') == 'app' or
-        'Claude Cloud Agent' in comment_text or
-        '🤖' in comment_text or  # Bot emoji used in start message
-        '💬 **Claude:**' in comment_text or  # Claude response format
-        comment_text.startswith('Claude Cloud Agent')
-    )
-
-    if is_bot_comment:
-        print(f"Skipping bot comment on {issue_key}")
-        return {'statusCode': 200, 'body': 'Bot comment, ignoring'}
-
-    # Find session by JIRA issue key
-    response = sessions_table.query(
-        IndexName='jira-issue-index',
-        KeyConditionExpression='jira_issue_key = :key',
-        ExpressionAttributeValues={':key': issue_key}
-    )
-
-    if not response['Items']:
-        return {'statusCode': 200, 'body': 'No session found for this JIRA issue'}
-
-    session = response['Items'][0]
-
-    # Skip if session is already running (prevent duplicate tasks)
-    if session.get('status') == 'running':
-        print(f"Session {session['session_id']} already running, skipping")
-        return {'statusCode': 200, 'body': 'Session already running'}
-
-    # Extract comment text
-    comment_body = comment.get('body', '')
-    if isinstance(comment_body, dict):
-        comment_body = extract_text_from_adf(comment_body)
-
-    # Resume agent with user's comment as new instruction
-    start_agent_task(
-        session_id=session['session_id'],
-        pr_number=session['pr_number'],
-        branch=session['branch'],
-        prompt=comment_body,
-        repo=session['repo'],
-        source='jira',
-        jira_issue_key=issue_key,
-        jira_site=session.get('jira_site'),
-        resume=True
-    )
-
-    return {'statusCode': 200, 'body': 'Session resumed from JIRA comment'}
-
-
-def format_jira_pr_description(issue_key: str, summary: str, description: str, jira_site: str) -> str:
-    """Format PR description from JIRA issue."""
-
-    return f"""## Claude Cloud Agent Session
-
-This PR was automatically created from JIRA issue [{issue_key}](https://{jira_site}/browse/{issue_key}).
-
-### Original Request
-
-**{summary}**
-
-{description}
-
----
-
-**Session ID:** `jira-{issue_key}`
-**JIRA Link:** https://{jira_site}/browse/{issue_key}
-
-All development work is logged below as comments.
-"""
-
-
-def extract_text_from_adf(adf: dict) -> str:
-    """Extract plain text from Atlassian Document Format."""
-
-    if not isinstance(adf, dict):
-        return str(adf)
-
-    text_parts = []
-
-    def extract_recursive(node):
-        if isinstance(node, dict):
-            if node.get('type') == 'text':
-                text_parts.append(node.get('text', ''))
-            for child in node.get('content', []):
-                extract_recursive(child)
-        elif isinstance(node, list):
-            for item in node:
-                extract_recursive(item)
-
-    extract_recursive(adf)
-    return ' '.join(text_parts)
-
-
-# =============================================================================
-# Shared Functions
-# =============================================================================
-
-def start_agent_task(session_id: str, pr_number: int, branch: str,
-                     prompt: str, repo: str, source: str = 'github',
-                     jira_issue_key: str = None, jira_site: str = None,
-                     resume: bool = False):
-    """Start agent ECS task to run Claude Code."""
-
-    cluster = os.environ.get('ECS_CLUSTER', 'claude-cloud-agent')
-    task_definition = os.environ.get('AGENT_TASK_DEFINITION', 'claude-cloud-agent')
-    subnets = os.environ.get('SUBNETS', '').split(',')
-    security_groups = os.environ.get('SECURITY_GROUPS', '').split(',')
-
-    # Escape prompt for shell
-    safe_prompt = prompt.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
-
-    # Build environment variables
-    env_vars = [
-        {'name': 'SESSION_ID', 'value': session_id},
-        {'name': 'PR_NUMBER', 'value': str(pr_number)},
-        {'name': 'BRANCH', 'value': branch},
-        {'name': 'REPO', 'value': repo},
-        {'name': 'PROMPT', 'value': safe_prompt},
-        {'name': 'RESUME', 'value': str(resume).lower()},
-        {'name': 'SOURCE', 'value': source},
-    ]
-
-    # Add JIRA-specific env vars if applicable
-    if source == 'jira':
-        if jira_issue_key:
-            env_vars.append({'name': 'JIRA_ISSUE_KEY', 'value': jira_issue_key})
-        if jira_site:
-            env_vars.append({'name': 'JIRA_SITE', 'value': jira_site})
-        jira_secret_arn = os.environ.get('JIRA_SECRET_ARN')
-        if jira_secret_arn:
-            env_vars.append({'name': 'JIRA_SECRET_ARN', 'value': jira_secret_arn})
-
+    # Launch test_tickets ECS task
+    logger.info(f"Launching test_tickets ECS task for session {session_id}")
     try:
-        response = ecs.run_task(
-            cluster=cluster,
-            taskDefinition=task_definition,
-            launchType='FARGATE',
-            enableExecuteCommand=True,  # Enable ECS Exec for UAT access
-            networkConfiguration={
-                'awsvpcConfiguration': {
-                    'subnets': [s.strip() for s in subnets if s.strip()],
-                    'securityGroups': [s.strip() for s in security_groups if s.strip()],
-                    'assignPublicIp': 'ENABLED'
-                }
-            },
-            overrides={
-                'containerOverrides': [{
-                    'name': os.environ.get('CONTAINER_NAME', 'claude-cloud-agent'),
-                    'environment': env_vars
-                }]
-            },
-            tags=[
-                {'key': 'session_id', 'value': session_id},
-                {'key': 'pr_number', 'value': str(pr_number)},
-                {'key': 'source', 'value': source}
-            ]
+        task_arn = ecs.launch_test_tickets_task(
+            session_id=session_id,
+            branch=branch_name,
+            pr_number=issue_number,
+            repo=repo_full_name,
+            github_token=github.get_token()
+        )
+    except Exception as e:
+        logger.error(f"Failed to launch test_tickets task: {e}")
+        sessions.update_session(session_id, status="FAILED")
+
+        github.create_issue_comment(
+            repo_full_name,
+            issue_number,
+            f"<!-- claude-agent -->\n:x: **UAT Failed to Start**\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Please check the configuration and try again."
         )
 
-        if response.get('tasks'):
-            task_arn = response['tasks'][0]['taskArn']
-            task_id = task_arn.split('/')[-1]  # Extract task ID from ARN
-            print(f"Started agent task: {task_arn}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
 
-            # Build UAT connection command
-            container_name = os.environ.get('CONTAINER_NAME', 'claude-cloud-agent')
-            uat_command = (
-                f"aws ecs execute-command --cluster {cluster} "
-                f"--task {task_id} --container {container_name} "
-                f"--interactive --command /bin/bash"
-            )
+    # Update session with task ARN
+    uat_url = f"https://{session_id}.{UAT_DOMAIN_SUFFIX}"
+    sessions.update_session(
+        session_id,
+        task_arn=task_arn,
+        uat_url=uat_url
+    )
 
-            sessions_table.update_item(
-                Key={'session_id': session_id},
-                UpdateExpression='SET agent_task_arn = :arn, #status = :status, uat_command = :cmd',
-                ExpressionAttributeNames={'#status': 'status'},
-                ExpressionAttributeValues={
-                    ':arn': task_arn,
-                    ':status': 'running',
-                    ':cmd': uat_command
-                }
-            )
+    # Post UAT URL to issue
+    github.create_issue_comment(
+        repo_full_name,
+        issue_number,
+        f"<!-- claude-agent -->\n**UAT Environment Starting**\n\n"
+        f"URL: {uat_url}\n\n"
+        f"Branch: `{branch_name}`\n"
+        f"Session: `{session_id}`\n\n"
+        f"The environment will be available shortly. "
+        f"Authentication uses staging (`app.teammobot.dev`).\n\n"
+        f"To stop this UAT, close the issue or remove the `{TEST_TICKETS_TRIGGER_LABEL}` label."
+    )
 
-            # Return task info for UAT link posting
-            return {'task_arn': task_arn, 'task_id': task_id, 'uat_command': uat_command}
-        else:
-            print(f"Failed to start agent task: {response.get('failures', [])}")
-            return None
+    logger.info(f"test_tickets UAT session {session_id} started successfully")
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "UAT started",
+            "session_id": session_id,
+            "uat_url": uat_url,
+            "task_arn": task_arn
+        })
+    }
 
+
+def handle_pr_labeled(
+    payload: dict,
+    github: GitHubClient,
+    sessions: SessionManager,
+    ecs: ECSLauncher
+) -> dict:
+    """
+    Handle PR labeled event.
+
+    When a PR in test_tickets is labeled with 'uat' or 'claude-dev':
+    1. Get the branch name from the PR
+    2. Create unique session ID
+    3. Launch test_tickets ECS task
+    4. Post UAT URL to PR
+    5. If 'claude-dev', queue initial prompt for auto-implementation
+    """
+    pr = payload.get("pull_request", {})
+    label = payload.get("label", {})
+    repo = payload.get("repository", {})
+
+    label_name = label.get("name", "")
+    repo_full_name = repo.get("full_name", "")
+
+    # Only handle test_tickets repo
+    if repo_full_name != TEST_TICKETS_REPO:
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Not test_tickets repo"})
+        }
+
+    # Check for either uat or claude-dev label
+    is_uat = label_name == TEST_TICKETS_TRIGGER_LABEL
+    is_claude_dev = label_name == TEST_TICKETS_CLAUDE_LABEL
+
+    if not (is_uat or is_claude_dev):
+        logger.info(f"Ignoring label: {label_name}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Not uat or claude-dev label"})
+        }
+
+    if not TEST_TICKETS_TASK_DEFINITION:
+        logger.error("TEST_TICKETS_TASK_DEFINITION not configured")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": "Task definition not configured"})
+        }
+
+    pr_number = pr.get("number")
+    pr_title = pr.get("title", "")
+    pr_body = pr.get("body", "") or ""
+    branch_name = pr.get("head", {}).get("ref", "")
+
+    if not branch_name:
+        logger.error(f"No branch found for PR #{pr_number}")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"error": "No branch found"})
+        }
+
+    logger.info(f"Starting test_tickets UAT for PR #{pr_number} branch {branch_name} (claude_dev={is_claude_dev})")
+
+    # Create session ID (sanitize branch name for subdomain)
+    safe_branch = branch_name.replace("/", "-").replace("_", "-").lower()
+    session_id = f"tt-{safe_branch}"[:50]  # Limit length for subdomain
+
+    # Check for existing session
+    existing = sessions.get_session(session_id)
+    if existing and existing.get("status") in ("STARTING", "RUNNING"):
+        uat_url = f"https://{session_id}.{UAT_DOMAIN_SUFFIX}"
+        logger.info(f"UAT session already exists: {session_id}")
+
+        # Post reminder comment on PR
+        github.create_issue_comment(
+            repo_full_name,
+            pr_number,
+            f"<!-- claude-agent -->\n**UAT Already Running**\n\n"
+            f"URL: {uat_url}\n\n"
+            f"Session: `{session_id}`"
+        )
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "UAT session already exists",
+                "session_id": session_id,
+                "uat_url": uat_url
+            })
+        }
+
+    # Create session record
+    logger.info(f"Creating test_tickets UAT session {session_id}")
+    sessions.create_session(
+        session_id=session_id,
+        repo_full_name=repo_full_name,
+        issue_number=pr_number,
+        pr_number=pr_number,
+        branch_name=branch_name
+    )
+
+    # If claude-dev, prepare initial prompt for auto-implementation
+    initial_prompt = None
+    if is_claude_dev:
+        initial_prompt = f"""Implement this PR:
+
+## {pr_title}
+
+{pr_body}
+
+Read the codebase, understand the requirements, and implement the changes.
+Commit your work when complete and push to the remote branch."""
+        logger.info(f"Queuing initial prompt for claude-dev: {initial_prompt[:100]}...")
+
+    # Launch test_tickets ECS task
+    logger.info(f"Launching test_tickets ECS task for session {session_id}")
+    try:
+        task_arn = ecs.launch_test_tickets_task(
+            session_id=session_id,
+            branch=branch_name,
+            pr_number=pr_number,
+            repo=repo_full_name,
+            github_token=github.get_token()
+        )
     except Exception as e:
-        print(f"Error starting agent task: {e}")
-        return None
+        logger.error(f"Failed to launch test_tickets task: {e}")
+        sessions.update_session(session_id, status="FAILED")
+
+        github.create_issue_comment(
+            repo_full_name,
+            pr_number,
+            f"<!-- claude-agent -->\n:x: **UAT Failed to Start**\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Please check the configuration and try again."
+        )
+
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
+
+    # Update session with task ARN and initial_prompt (if claude-dev)
+    uat_url = f"https://{session_id}.{UAT_DOMAIN_SUFFIX}"
+    sessions.update_session(
+        session_id,
+        task_arn=task_arn,
+        uat_url=uat_url,
+        initial_prompt=initial_prompt
+    )
+
+    # Post UAT URL to PR with appropriate message
+    if is_claude_dev:
+        comment = (
+            f"<!-- claude-agent -->\n**UAT + Claude Agent Starting**\n\n"
+            f"URL: {uat_url}\n\n"
+            f"Branch: `{branch_name}`\n"
+            f"Session: `{session_id}`\n\n"
+            f"The environment will be available shortly. "
+            f"Claude will automatically start implementing the PR description.\n\n"
+            f"Comment on this PR to provide feedback or additional instructions.\n\n"
+            f"To stop, close the PR or remove the `{TEST_TICKETS_CLAUDE_LABEL}` label."
+        )
+    else:
+        comment = (
+            f"<!-- claude-agent -->\n**UAT Environment Starting**\n\n"
+            f"URL: {uat_url}\n\n"
+            f"Branch: `{branch_name}`\n"
+            f"Session: `{session_id}`\n\n"
+            f"The environment will be available shortly. "
+            f"Authentication uses staging (`app.teammobot.dev`).\n\n"
+            f"To stop this UAT, close the PR or remove the `{TEST_TICKETS_TRIGGER_LABEL}` label."
+        )
+
+    github.create_issue_comment(repo_full_name, pr_number, comment)
+
+    logger.info(f"test_tickets UAT session {session_id} started from PR (claude_dev={is_claude_dev})")
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "UAT started",
+            "session_id": session_id,
+            "uat_url": uat_url,
+            "task_arn": task_arn,
+            "claude_dev": is_claude_dev
+        })
+    }
+
+
+def handle_pr_unlabeled_or_closed(
+    payload: dict,
+    github: GitHubClient,
+    sessions: SessionManager,
+    ecs: ECSLauncher
+) -> dict:
+    """
+    Handle PR unlabeled or closed event.
+
+    Stops UAT environment when 'uat' label is removed or PR is closed/merged.
+    """
+    pr = payload.get("pull_request", {})
+    repo = payload.get("repository", {})
+    action = payload.get("action")
+    label = payload.get("label", {})
+
+    pr_number = pr.get("number")
+    repo_full_name = repo.get("full_name")
+    branch_name = pr.get("head", {}).get("ref", "")
+
+    # For non-test_tickets repos, delegate to original PR closed handler
+    if repo_full_name != TEST_TICKETS_REPO:
+        if action == "closed":
+            return handle_pr_closed(payload, github, sessions, ecs)
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Not test_tickets repo"})
+        }
+
+    # For unlabeled events, only handle 'uat' or 'claude-dev' label removal
+    if action == "unlabeled":
+        removed_label = label.get("name")
+        if removed_label not in (TEST_TICKETS_TRIGGER_LABEL, TEST_TICKETS_CLAUDE_LABEL):
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "Not uat or claude-dev label"})
+            }
+
+    # For closed events, check if the PR had either uat or claude-dev label
+    if action == "closed":
+        labels = pr.get("labels", [])
+        label_names = [l.get("name") for l in labels]
+        has_trigger_label = (
+            TEST_TICKETS_TRIGGER_LABEL in label_names or
+            TEST_TICKETS_CLAUDE_LABEL in label_names
+        )
+        if not has_trigger_label:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "PR did not have uat or claude-dev label"})
+            }
+
+    # Derive session_id from branch name (same logic as handle_pr_labeled)
+    if branch_name:
+        safe_branch = branch_name.replace("/", "-").replace("_", "-").lower()
+        session_id = f"tt-{safe_branch}"[:50]
+    else:
+        # Fallback: look up by PR number
+        session = sessions.get_session_by_pr(repo_full_name, pr_number)
+        if not session:
+            logger.info(f"No UAT session found for PR #{pr_number}")
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "No session to clean up"})
+            }
+        session_id = session["session_id"]
+
+    # Look up session
+    session = sessions.get_session(session_id)
+    if not session:
+        logger.info(f"No UAT session found: {session_id}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "No session to clean up"})
+        }
+
+    task_arn = session.get("task_arn")
+
+    logger.info(f"Stopping UAT session {session_id} (action={action})")
+
+    # Stop ECS task if running
+    if task_arn and session.get("status") in ("STARTING", "RUNNING"):
+        try:
+            ecs.stop_task(task_arn, reason=f"PR {action}")
+            logger.info(f"Stopped task {task_arn}")
+        except Exception as e:
+            logger.error(f"Failed to stop task: {e}")
+
+    # Clean up ALB resources
+    cleanup_uat_resources(session)
+
+    # Update session status
+    sessions.update_session(session_id, status="STOPPED")
+
+    # Post comment to PR
+    try:
+        github.create_issue_comment(
+            repo_full_name,
+            pr_number,
+            f"<!-- claude-agent -->\n**UAT Environment Stopped**\n\n"
+            f"The UAT environment for `{session_id}` has been shut down."
+        )
+    except Exception as e:
+        logger.error(f"Failed to post comment: {e}")
+
+    logger.info(f"UAT session {session_id} stopped")
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "UAT session stopped",
+            "session_id": session_id
+        })
+    }

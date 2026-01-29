@@ -1,0 +1,73 @@
+{
+  "family": "test-tickets-uat",
+  "taskRoleArn": "arn:aws:iam::678954237808:role/test-tickets-ecs-task-role",
+  "executionRoleArn": "arn:aws:iam::678954237808:role/test-tickets-ecs-execution-role",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "containerDefinitions": [
+    {
+      "name": "test-tickets",
+      "image": "678954237808.dkr.ecr.us-east-1.amazonaws.com/test-tickets-uat:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 3001,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {"name": "NODE_ENV", "value": "production"},
+        {"name": "PORT", "value": "3001"},
+        {"name": "MOBOT_BASE_URL", "value": "https://app.teammobot.dev"},
+        {"name": "GCP_REGION", "value": "global"},
+        {"name": "SESSIONS_TABLE", "value": "claude-cloud-agent-sessions"},
+        {"name": "TARGET_GROUP_ARN", "value": "arn:aws:elasticloadbalancing:us-east-1:678954237808:targetgroup/test-tickets-uat-tg/2f134c8b54fbcb18"},
+        {"name": "ALB_LISTENER_ARN", "value": "arn:aws:elasticloadbalancing:us-east-1:678954237808:listener/app/test-tickets-uat-alb/7e47b6b368ee29e1/9b650b437fde8e6f"},
+        {"name": "VPC_ID", "value": "vpc-0fde49947ce39aec4"},
+        {"name": "UAT_DOMAIN_SUFFIX", "value": "uat.teammobot.dev"},
+        {"name": "REPO", "value": "team-mobot/test_tickets"}
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:test-tickets/uat/agnts-0-aViArH:DATABASE_URL::"
+        },
+        {
+          "name": "JWT_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:test-tickets/uat/agnts-0-aViArH:JWT_SECRET::"
+        },
+        {
+          "name": "MOBOT_JWS_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:test-tickets/uat/agnts-0-aViArH:MOBOT_JWS_SECRET::"
+        },
+        {
+          "name": "GOOGLE_CLIENT_ID",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:test-tickets/uat/agnts-0-aViArH:GOOGLE_CLIENT_ID::"
+        },
+        {
+          "name": "GCP_PROJECT_ID",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:test-tickets/uat/agnts-0-aViArH:GCP_PROJECT_ID::"
+        },
+        {
+          "name": "GEMINI_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:test-tickets/uat/agnts-0-aViArH:GEMINI_API_KEY::"
+        },
+        {
+          "name": "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:test-tickets/uat/agnts-0-aViArH:GOOGLE_APPLICATION_CREDENTIALS_JSON::"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/test-tickets-uat",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "uat",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

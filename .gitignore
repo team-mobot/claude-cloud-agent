@@ -27,3 +27,17 @@ Thumbs.db
 
 # AWS
 .aws-sam/
+
+# Build/deploy artifacts
+lambda-pkg/
+lambda-pkg-new/
+webhook-deploy/
+webhook_package/
+wheels/
+infrastructure/
+
+# Temporary task definitions and test files
+task-def-v[0-9].json
+!task-def-v5.json
+test-event.json
+test-tickets-uat-task-def.json
