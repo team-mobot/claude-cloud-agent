@@ -18,31 +18,48 @@ cd /app/repo
 git config user.email "claude-dev@teammobot.dev"
 git config user.name "Claude Dev Agent"
 
-# Patch Vite config to allow UAT subdomain hosts
-echo "  Patching Vite config for UAT subdomains..."
-node -e "
+# Create a vite wrapper script that patches config before each run
+echo "  Creating Vite wrapper script..."
+cat > /app/vite-wrapper.js << 'VITE_WRAPPER'
+#!/usr/bin/env node
 const fs = require('fs');
+const { spawn } = require('child_process');
+
+// Patch Vite config to allow UAT subdomain hosts
 const configs = ['vite.config.ts', 'vite.config.js', 'vite.config.mts', 'vite.config.mjs'];
 const config = configs.find(f => fs.existsSync(f));
 if (config) {
     let content = fs.readFileSync(config, 'utf8');
-    // Check if allowedHosts already configured
     if (!content.includes('allowedHosts')) {
-        // Add allowedHosts to existing server config or create server config
         if (content.includes('server:') || content.includes('server :')) {
-            // Insert after 'server: {' or 'server:{'
-            content = content.replace(/(server\s*:\s*\{)/, '\$1 allowedHosts: true,');
+            content = content.replace(/(server\s*:\s*\{)/, '$1 allowedHosts: true,');
         } else {
-            // Add server config before final closing brace of defineConfig
-            content = content.replace(/(\}\s*\)\s*;?\s*)$/, ', server: { allowedHosts: true } \$1');
+            content = content.replace(/(\}\s*\)\s*;?\s*)$/, ', server: { allowedHosts: true } $1');
         }
         fs.writeFileSync(config, content);
-        console.log('  Patched ' + config + ' with allowedHosts: true');
-    } else {
-        console.log('  ' + config + ' already has allowedHosts configured');
+        console.log('[vite-wrapper] Patched ' + config + ' with allowedHosts: true');
     }
+}
+
+// Run vite with all passed arguments
+const args = process.argv.slice(2);
+const vite = spawn('npx', ['vite', ...args], { stdio: 'inherit' });
+vite.on('close', (code) => process.exit(code));
+VITE_WRAPPER
+
+chmod +x /app/vite-wrapper.js
+
+# Modify package.json to use our wrapper instead of vite directly
+echo "  Updating package.json to use Vite wrapper..."
+node -e "
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+if (pkg.scripts && pkg.scripts.dev === 'vite') {
+    pkg.scripts.dev = 'node /app/vite-wrapper.js';
+    fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+    console.log('  Updated package.json dev script to use vite-wrapper');
 } else {
-    console.log('  No vite config found, skipping patch');
+    console.log('  package.json dev script is not simple vite command, skipping');
 }
 "
 
@@ -62,25 +79,8 @@ export VITE_GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}"
 export VITE_API_URL=""
 
 echo "[3/8] Starting Vite dev server..."
-# Re-apply Vite config patch (in case it was reverted during development)
-node -e "
-const fs = require('fs');
-const configs = ['vite.config.ts', 'vite.config.js', 'vite.config.mts', 'vite.config.mjs'];
-const config = configs.find(f => fs.existsSync(f));
-if (config) {
-    let content = fs.readFileSync(config, 'utf8');
-    if (!content.includes('allowedHosts')) {
-        if (content.includes('server:') || content.includes('server :')) {
-            content = content.replace(/(server\s*:\s*\{)/, '\$1 allowedHosts: true,');
-        } else {
-            content = content.replace(/(\}\s*\)\s*;?\s*)$/, ', server: { allowedHosts: true } \$1');
-        }
-        fs.writeFileSync(config, content);
-        console.log('  Re-applied Vite allowedHosts patch to ' + config);
-    }
-}
-"
-# Start Vite in background with network access enabled
+# Start Vite using our wrapper (which patches allowedHosts before each run)
+# This handles both initial start and any restarts by Claude agent
 npm run dev -- --host 0.0.0.0 --port 5173 &
 VITE_PID=$!
 echo "  Vite dev server started (PID: $VITE_PID) on port 5173"
