@@ -3,9 +3,17 @@
 # Usage: ./list-uat-resources.sh
 
 CLUSTER="claude-cloud-agent"
-SESSIONS_TABLE="claude-dev-uat-sessions"
+SESSIONS_TABLE="claude-cloud-agent-sessions"
 ALB_NAME="test-tickets-uat-alb"
+ECR_REPO="claude-dev-uat"
 REGION="${AWS_REGION:-us-east-1}"
+
+# Define aws function to use docker if aws CLI not in PATH
+if ! command -v aws &> /dev/null; then
+    aws() {
+        docker run --rm -v ~/.aws:/root/.aws -v "$(pwd):/aws" amazon/aws-cli "$@"
+    }
+fi
 
 echo "========================================"
 echo "UAT Resources Report"
@@ -149,8 +157,8 @@ fi
 
 # 5. ECR Images (last 5)
 echo ""
-echo "=== ECR Images (test-tickets-uat, last 5) ==="
-aws ecr describe-images --repository-name test-tickets-uat \
+echo "=== ECR Images ($ECR_REPO, last 5) ==="
+aws ecr describe-images --repository-name "$ECR_REPO" \
     --query 'sort_by(imageDetails, &imagePushedAt)[-5:]' \
     --output json 2>/dev/null | python3 -c "
 import sys, json
