@@ -33,12 +33,16 @@ case "$MODE" in
     ;;
 
   promote)
-    echo "==> Pulling :staging image..."
-    docker pull "$ECR_REPO:staging"
+    echo "==> Getting :staging image manifest..."
+    STAGING_MANIFEST=$($AWS_CMD ecr batch-get-image --repository-name test-tickets-uat --image-ids imageTag=staging --query 'images[0].imageManifest' --output text)
 
-    echo "==> Retagging as :latest and pushing..."
-    docker tag "$ECR_REPO:staging" "$ECR_REPO:latest"
-    docker push "$ECR_REPO:latest"
+    if [ -z "$STAGING_MANIFEST" ] || [ "$STAGING_MANIFEST" = "None" ]; then
+        echo "Error: Could not get staging manifest"
+        exit 1
+    fi
+
+    echo "==> Tagging :staging as :latest in ECR..."
+    $AWS_CMD ecr put-image --repository-name test-tickets-uat --image-tag latest --image-manifest "$STAGING_MANIFEST" > /dev/null
 
     echo "==> Done! Promoted :staging to :latest (production)"
     ;;

@@ -186,6 +186,52 @@ class ECSLauncher:
 
         return None
 
+    def _register_task_definition_with_image(self, base_task_definition: str, image_uri: str) -> str:
+        """
+        Register a new task definition revision with a custom image.
+
+        ECS doesn't support overriding the container image at runtime via containerOverrides.
+        Instead, we must register a new task definition revision with the desired image.
+
+        Args:
+            base_task_definition: The task definition family or ARN to base the new revision on
+            image_uri: The full image URI including tag (e.g., repo:staging)
+
+        Returns:
+            The new task definition ARN
+        """
+        # Get the current task definition
+        response = self.ecs.describe_task_definition(taskDefinition=base_task_definition)
+        task_def = response["taskDefinition"]
+
+        # Clone container definitions and update the image
+        container_defs = task_def["containerDefinitions"]
+        for container in container_defs:
+            container["image"] = image_uri
+
+        # Register new revision (only include fields that register_task_definition accepts)
+        register_params = {
+            "family": task_def["family"],
+            "containerDefinitions": container_defs,
+            "taskRoleArn": task_def.get("taskRoleArn"),
+            "executionRoleArn": task_def.get("executionRoleArn"),
+            "networkMode": task_def.get("networkMode"),
+            "requiresCompatibilities": task_def.get("requiresCompatibilities", []),
+            "cpu": task_def.get("cpu"),
+            "memory": task_def.get("memory"),
+        }
+
+        # Remove None values
+        register_params = {k: v for k, v in register_params.items() if v is not None}
+
+        logger.info(f"Registering new task definition revision with image: {image_uri}")
+        response = self.ecs.register_task_definition(**register_params)
+
+        new_task_def_arn = response["taskDefinition"]["taskDefinitionArn"]
+        logger.info(f"Registered new task definition: {new_task_def_arn}")
+
+        return new_task_def_arn
+
     def launch_test_tickets_task(
         self,
         session_id: str,
@@ -236,15 +282,25 @@ class ECSLauncher:
         # Construct the full image URI with tag
         image_uri = f"{self.test_tickets_image_uri}:{image_tag}"
 
+        # Determine which task definition to use
+        # If using a non-default image tag, register a new task definition revision
+        if image_tag != "latest":
+            task_definition_arn = self._register_task_definition_with_image(
+                self.test_tickets_task_definition,
+                image_uri
+            )
+        else:
+            task_definition_arn = self.test_tickets_task_definition
+
         logger.info(f"Launching test_tickets task for session {session_id}")
         logger.info(f"  Cluster: {self.cluster}")
-        logger.info(f"  Task Definition: {self.test_tickets_task_definition}")
+        logger.info(f"  Task Definition: {task_definition_arn}")
         logger.info(f"  Image: {image_uri}")
         logger.info(f"  Branch: {branch}")
 
         response = self.ecs.run_task(
             cluster=self.cluster,
-            taskDefinition=self.test_tickets_task_definition,
+            taskDefinition=task_definition_arn,
             launchType="FARGATE",
             networkConfiguration={
                 "awsvpcConfiguration": {
@@ -257,8 +313,7 @@ class ECSLauncher:
                 "containerOverrides": [
                     {
                         "name": "test-tickets",
-                        "environment": env_overrides,
-                        "image": image_uri
+                        "environment": env_overrides
                     }
                 ]
             },

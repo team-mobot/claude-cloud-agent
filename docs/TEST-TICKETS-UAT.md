@@ -23,6 +23,116 @@ The environment is accessible at `https://tt-{branch-name}.uat.teammobot.dev` an
 
 To stop: Remove the `uat` label or close/merge the PR.
 
+## Staging/Production Image Workflow
+
+The UAT system supports testing container changes before deploying to production using separate Docker image tags.
+
+### Image Tags
+
+| Tag | Purpose | Used By |
+|-----|---------|---------|
+| `:latest` | Production image | `uat` label |
+| `:staging` | Testing image | `uat-staging` label |
+| `:{git-sha}` | Immutable reference | Rollback/auditing |
+
+### Workflow
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  1. Build &     │     │  2. Test with   │     │  3. Promote to  │
+│  Push :staging  │ ──▶ │  uat-staging    │ ──▶ │  :latest        │
+│                 │     │  label          │     │                 │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+     deploy.sh              GitHub PR            deploy.sh promote
+      staging
+```
+
+### Step-by-Step
+
+#### 1. Build and Push Staging Image
+
+```bash
+cd test-tickets-uat
+./deploy.sh staging
+```
+
+This builds the Docker image and pushes it with two tags:
+- `:staging` - For testing
+- `:{git-sha}` - Immutable reference (e.g., `:16b7bc7`)
+
+#### 2. Test with Staging Image
+
+Add the `uat-staging` label to a PR. This:
+- Creates a new ECS task definition revision with the `:staging` image
+- Launches the container with the staging image
+- Posts a "UAT Environment Started" comment
+
+Verify your changes work correctly in the UAT environment.
+
+#### 3. Promote to Production
+
+Once testing passes:
+
+```bash
+./deploy.sh promote
+```
+
+This copies the `:staging` image manifest to `:latest` in ECR (no rebuild needed).
+
+#### 4. Production Deployment
+
+New UATs with the regular `uat` label will now use the updated `:latest` image.
+
+### Deploy Script Reference
+
+```bash
+./deploy.sh staging   # Build and push :staging (default)
+./deploy.sh promote   # Copy :staging to :latest
+./deploy.sh latest    # Build and push directly to :latest (emergency hotfix)
+```
+
+### How It Works (Technical Details)
+
+The `ecs_launcher.py` handles image tag selection:
+
+1. **For `uat` label (`image_tag="latest"`):**
+   - Uses the base task definition (`test-tickets-uat`) which has `:latest` image
+   - No new task definition revision created
+
+2. **For `uat-staging` label (`image_tag="staging"`):**
+   - Calls `_register_task_definition_with_image()` to create a new task definition revision
+   - The new revision has the `:staging` image baked in
+   - Launches task with the new revision
+
+This approach is required because ECS `run-task` API does not support overriding the container image via `containerOverrides`. The image must be set at the task definition level.
+
+### Labels Reference
+
+| Label | Image Tag | Task Definition | Use Case |
+|-------|-----------|-----------------|----------|
+| `uat` | `:latest` | Base revision | Production testing |
+| `uat-staging` | `:staging` | New revision | Container changes testing |
+| `claude-dev` | `:latest` | Base revision | AI-assisted development |
+
+### Rollback
+
+If a promoted image has issues:
+
+```bash
+# Find the previous working image SHA
+aws ecr describe-images --repository-name test-tickets-uat \
+  --query 'imageDetails[*].{tags:imageTags,pushed:imagePushedAt}' \
+  --output table
+
+# Re-tag a known good SHA as :latest
+aws ecr batch-get-image --repository-name test-tickets-uat \
+  --image-ids imageTag={known-good-sha} \
+  --query 'images[0].imageManifest' --output text > /tmp/manifest.json
+
+aws ecr put-image --repository-name test-tickets-uat \
+  --image-tag latest --image-manifest file:///tmp/manifest.json
+```
+
 ## Architecture
 
 ```
@@ -193,36 +303,69 @@ Plus DynamoDB write access to the sessions table.
 
 ## Deployment
 
-### Update Docker Image
+### Update Docker Image (Recommended: Staging Workflow)
+
+Always use the staging workflow for container changes:
 
 ```bash
 cd test-tickets-uat
 
-# Build for AMD64 (required for ECS Fargate)
-docker buildx build --platform linux/amd64 -t test-tickets-uat:latest .
+# 1. Build and push to :staging
+./deploy.sh staging
 
-# Tag and push to ECR
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 678954237808.dkr.ecr.us-east-1.amazonaws.com
-docker tag test-tickets-uat:latest 678954237808.dkr.ecr.us-east-1.amazonaws.com/test-tickets-uat:latest
-docker push 678954237808.dkr.ecr.us-east-1.amazonaws.com/test-tickets-uat:latest
+# 2. Test with uat-staging label on a PR
+
+# 3. After testing passes, promote to production
+./deploy.sh promote
+```
+
+### Update Docker Image (Emergency Hotfix)
+
+For urgent fixes that can't wait for staging testing:
+
+```bash
+cd test-tickets-uat
+./deploy.sh latest   # Builds and pushes directly to :latest
 ```
 
 ### Update Task Definition
+
+Only needed when changing CPU, memory, IAM roles, or secrets:
 
 ```bash
 aws ecs register-task-definition --cli-input-json file://task-def-v5.json
 ```
 
+Note: Image changes don't require updating the base task definition. The staging workflow creates new revisions automatically.
+
 ### Update Lambda
 
 ```bash
-cd webhook-deploy
-unzip -q ../webhook-v3.zip
-cp ../webhook/*.py .
-zip -q -r ../webhook-v4.zip .
+# Create deployment package with dependencies
+mkdir -p /tmp/webhook-deploy
+unzip -q webhook-lambda.zip -d /tmp/webhook-deploy
+cp webhook/*.py /tmp/webhook-deploy/
+cd /tmp/webhook-deploy && zip -q -r /tmp/webhook-updated.zip .
+
+# Deploy
 aws lambda update-function-code \
   --function-name claude-cloud-agent-webhook \
-  --zip-file fileb://webhook-v4.zip
+  --zip-file fileb:///tmp/webhook-updated.zip
+```
+
+### IAM Permissions for Staging Workflow
+
+The Lambda role needs these additional ECS permissions for the staging workflow:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "ecs:DescribeTaskDefinition",
+    "ecs:RegisterTaskDefinition"
+  ],
+  "Resource": "*"
+}
 ```
 
 ## Troubleshooting
@@ -278,16 +421,99 @@ aws elbv2 delete-rule --rule-arn <rule-arn>
 aws elbv2 delete-target-group --target-group-arn <tg-arn>
 ```
 
+### Staging Image Not Used
+
+If `uat-staging` label doesn't use the staging image:
+
+1. Check Lambda has `ecs:DescribeTaskDefinition` and `ecs:RegisterTaskDefinition` permissions
+2. Check CloudWatch logs for Lambda errors
+3. Verify `:staging` tag exists in ECR:
+   ```bash
+   aws ecr describe-images --repository-name test-tickets-uat \
+     --image-ids imageTag=staging
+   ```
+
+### "Unknown parameter: image" Error
+
+This error means the Lambda code is outdated. The old code tried to override the image via `containerOverrides` which ECS doesn't support. Deploy the latest Lambda code:
+
+```bash
+# The fix registers a new task definition revision instead
+cd /tmp && mkdir webhook-deploy && cd webhook-deploy
+unzip -q /path/to/webhook-lambda.zip
+cp /path/to/webhook/*.py .
+zip -q -r ../webhook-updated.zip .
+aws lambda update-function-code \
+  --function-name claude-cloud-agent-webhook \
+  --zip-file fileb:///tmp/webhook-updated.zip
+```
+
+### GitHub Comment Not Posted
+
+If the "UAT Environment Started" comment doesn't appear:
+
+1. Check container logs for HTTP status code:
+   ```bash
+   aws logs filter-log-events \
+     --log-group-name /ecs/test-tickets-uat \
+     --log-stream-name "uat/test-tickets/<task-id>" \
+     --filter-pattern "GitHub"
+   ```
+
+2. Common issues:
+   - `401`: GITHUB_TOKEN expired or invalid
+   - `400`: JSON body malformed (check escaping)
+   - `404`: Wrong repo or PR number
+
+3. The container uses Python's `json.dumps()` for proper JSON escaping of the comment body
+
+## Container Endpoints
+
+The prompt server (port 8080) exposes these endpoints:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check (status, queue length, processing state) |
+| `/status` | GET | Queue status and work directory |
+| `/version` | GET | Git commit info of running code |
+| `/prompt` | POST | Submit a prompt for Claude processing |
+
+### Version Endpoint
+
+Use `/version` to verify which code is running:
+
+```bash
+curl https://tt-{branch}.uat.teammobot.dev:8080/version
+```
+
+Response:
+```json
+{
+  "commit": "f2a93bf142841cec723122b4f3b0428bd65aa607",
+  "shortCommit": "f2a93bf",
+  "branch": "add-toast-notifications",
+  "commitDate": "2026-01-30 17:56:20 -0500",
+  "commitMessage": "Add toast notification system",
+  "workDir": "/app/repo",
+  "nodeVersion": "v20.20.0",
+  "uptime": 103.19
+}
+```
+
+Note: This shows the git commit of the **cloned branch**, not the container image version. The container image version is visible in the ECS task definition.
+
 ## Files Reference
 
 | File | Purpose |
 |------|---------|
 | `webhook/handler.py` | GitHub webhook routing and UAT lifecycle |
-| `webhook/ecs_launcher.py` | ECS task launching |
+| `webhook/ecs_launcher.py` | ECS task launching and task definition management |
 | `webhook/session_manager.py` | DynamoDB session CRUD |
 | `webhook/github_client.py` | GitHub API client |
 | `test-tickets-uat/Dockerfile` | Container image definition |
-| `test-tickets-uat/entrypoint.sh` | Container startup script |
+| `test-tickets-uat/entrypoint.sh` | Container startup script (cloning, ALB setup, GitHub comments) |
+| `test-tickets-uat/prompt-server.js` | HTTP API for health, status, version, and prompts |
+| `test-tickets-uat/deploy.sh` | Build and deployment script (staging/promote/latest) |
 | `task-def-v5.json` | ECS task definition |
 
 ## Limitations

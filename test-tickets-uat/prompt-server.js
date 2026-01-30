@@ -5,6 +5,22 @@ const { spawn, execSync } = require('child_process');
 const PORT = process.env.PROMPT_PORT || 8080;
 const WORK_DIR = process.env.WORK_DIR || '/app/repo';
 const SESSION_ID = process.env.SESSION_ID;
+
+// Get git commit info at startup
+function getGitInfo() {
+  try {
+    const commit = execSync('git rev-parse HEAD', { cwd: WORK_DIR, stdio: 'pipe' }).toString().trim();
+    const shortCommit = execSync('git rev-parse --short HEAD', { cwd: WORK_DIR, stdio: 'pipe' }).toString().trim();
+    const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: WORK_DIR, stdio: 'pipe' }).toString().trim();
+    const commitDate = execSync('git log -1 --format=%ci', { cwd: WORK_DIR, stdio: 'pipe' }).toString().trim();
+    const commitMessage = execSync('git log -1 --format=%s', { cwd: WORK_DIR, stdio: 'pipe' }).toString().trim();
+    return { commit, shortCommit, branch, commitDate, commitMessage };
+  } catch (error) {
+    return { error: error.message };
+  }
+}
+
+const GIT_INFO = getGitInfo();
 const SESSIONS_TABLE = process.env.SESSIONS_TABLE;
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 
@@ -487,6 +503,18 @@ const server = http.createServer(async (req, res) => {
       queueLength: promptQueue.length,
       isProcessing,
       claudeSessionId
+    }));
+    return;
+  }
+
+  // Version info
+  if (req.method === 'GET' && req.url === '/version') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ...GIT_INFO,
+      workDir: WORK_DIR,
+      nodeVersion: process.version,
+      uptime: process.uptime()
     }));
     return;
   }

@@ -255,32 +255,55 @@ except Exception as e:
             --output text 2>/dev/null)
 
         if [ -n "$INITIAL_PROMPT" ] && [ "$INITIAL_PROMPT" != "None" ]; then
-            COMMENT_BODY="<!-- claude-agent -->\n**UAT + Claude Agent Started**\n\n\
-URL: ${UAT_URL}\n\n\
-Branch: \`${BRANCH:-main}\`\n\
-Session: \`${SESSION_ID}\`\n\n\
-The environment is now available. \
-Claude will automatically start implementing the PR description.\n\n\
-Comment on this PR to provide feedback or additional instructions.\n\n\
-To stop, close the PR or remove the \`claude-dev\` label."
+            COMMENT_BODY=$(cat <<EOF
+<!-- claude-agent -->
+**UAT + Claude Agent Started**
+
+URL: ${UAT_URL}
+
+Branch: \`${BRANCH:-main}\`
+Session: \`${SESSION_ID}\`
+
+The environment is now available. Claude will automatically start implementing the PR description.
+
+Comment on this PR to provide feedback or additional instructions.
+
+To stop, close the PR or remove the \`claude-dev\` label.
+EOF
+)
         else
-            COMMENT_BODY="<!-- claude-agent -->\n**UAT Environment Started**\n\n\
-URL: ${UAT_URL}\n\n\
-Branch: \`${BRANCH:-main}\`\n\
-Session: \`${SESSION_ID}\`\n\n\
-The environment is now available. \
-Authentication uses staging (\`app.teammobot.dev\`).\n\n\
-To stop this UAT, close the issue/PR or remove the \`uat\` label."
+            COMMENT_BODY=$(cat <<EOF
+<!-- claude-agent -->
+**UAT Environment Started**
+
+URL: ${UAT_URL}
+
+Branch: \`${BRANCH:-main}\`
+Session: \`${SESSION_ID}\`
+
+The environment is now available. Authentication uses staging (\`app.teammobot.dev\`).
+
+To stop this UAT, close the issue/PR or remove the \`uat\` label.
+EOF
+)
         fi
 
         echo "  Posting UAT started comment to GitHub..."
-        curl -s -X POST \
+        # Properly escape the comment body for JSON
+        ESCAPED_BODY=$(echo "$COMMENT_BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+        HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             -H "Authorization: token ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Content-Type: application/json" \
-            -d "{\"body\": \"$(echo -e "$COMMENT_BODY")\"}" \
-            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            > /dev/null 2>&1 && echo "  Posted UAT started comment" || echo "  Warning: Could not post comment"
+            -d "{\"body\": ${ESCAPED_BODY}}" \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" 2>&1)
+        HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n1)
+        if [ "$HTTP_CODE" = "201" ]; then
+            echo "  Posted UAT started comment"
+        else
+            echo "  Warning: GitHub API returned $HTTP_CODE"
+            echo "  Response: $(echo "$HTTP_RESPONSE" | head -n1 | cut -c1-200)"
+        fi
     fi
 else
     echo "  Warning: SESSIONS_TABLE or SESSION_ID not set, skipping registration"
