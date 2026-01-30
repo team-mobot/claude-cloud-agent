@@ -36,6 +36,7 @@ TRIGGER_LABEL = "claude-dev"
 
 # test_tickets UAT configuration
 TEST_TICKETS_TRIGGER_LABEL = "uat"
+TEST_TICKETS_STAGING_LABEL = "uat-staging"  # Uses :staging image instead of :latest
 TEST_TICKETS_CLAUDE_LABEL = "claude-dev"  # Auto-starts Claude to implement PR
 TEST_TICKETS_REPO = "team-mobot/test_tickets"
 
@@ -219,10 +220,10 @@ def handle_issue_labeled(
     label_name = label.get("name", "")
     repo_full_name = repo.get("full_name", "")
 
-    # Check for test_tickets UAT trigger
+    # Check for test_tickets UAT trigger (uat or uat-staging)
     if (
         repo_full_name == TEST_TICKETS_REPO
-        and label_name == TEST_TICKETS_TRIGGER_LABEL
+        and label_name in (TEST_TICKETS_TRIGGER_LABEL, TEST_TICKETS_STAGING_LABEL)
         and TEST_TICKETS_TASK_DEFINITION
     ):
         return handle_test_tickets_uat(payload, github, sessions, ecs)
@@ -579,11 +580,11 @@ def handle_issue_unlabeled_or_closed(
             "body": json.dumps({"message": "Not test_tickets repo"})
         }
 
-    # For unlabeled events, only handle 'uat' label removal
-    if action == "unlabeled" and label.get("name") != TEST_TICKETS_TRIGGER_LABEL:
+    # For unlabeled events, only handle 'uat' or 'uat-staging' label removal
+    if action == "unlabeled" and label.get("name") not in (TEST_TICKETS_TRIGGER_LABEL, TEST_TICKETS_STAGING_LABEL):
         return {
             "statusCode": 200,
-            "body": json.dumps({"message": "Not uat label"})
+            "body": json.dumps({"message": "Not uat or uat-staging label"})
         }
 
     # Look up session by issue number
@@ -643,24 +644,32 @@ def handle_test_tickets_uat(
     """
     Handle test_tickets UAT deployment.
 
-    When an issue in test_tickets is labeled with 'uat':
+    When an issue in test_tickets is labeled with 'uat' or 'uat-staging':
     1. Parse branch name from issue (or use issue number)
     2. Create unique session ID
     3. Launch test_tickets ECS task with PostgreSQL
     4. Post UAT URL to issue
+
+    Uses :staging image for 'uat-staging' label, :latest for 'uat' label.
     """
     import uuid
     from datetime import datetime
 
     issue = payload.get("issue", {})
     repo = payload.get("repository", {})
+    label = payload.get("label", {})
+    label_name = label.get("name", "")
 
     issue_number = issue.get("number")
     issue_title = issue.get("title", "")
     issue_body = issue.get("body", "") or ""
     repo_full_name = repo.get("full_name")
 
-    logger.info(f"Starting test_tickets UAT for issue #{issue_number} in {repo_full_name}")
+    # Determine image tag based on label
+    is_staging = label_name == TEST_TICKETS_STAGING_LABEL
+    image_tag = "staging" if is_staging else "latest"
+
+    logger.info(f"Starting test_tickets UAT for issue #{issue_number} in {repo_full_name} (image_tag={image_tag})")
 
     # Parse branch name from issue body or title
     # Look for patterns like "branch: feature/xyz" or use issue number
@@ -714,14 +723,15 @@ def handle_test_tickets_uat(
     )
 
     # Launch test_tickets ECS task
-    logger.info(f"Launching test_tickets ECS task for session {session_id}")
+    logger.info(f"Launching test_tickets ECS task for session {session_id} (image_tag={image_tag})")
     try:
         task_arn = ecs.launch_test_tickets_task(
             session_id=session_id,
             branch=branch_name,
             pr_number=issue_number,
             repo=repo_full_name,
-            github_token=github.get_token()
+            github_token=github.get_token(),
+            image_tag=image_tag
         )
     except Exception as e:
         logger.error(f"Failed to launch test_tickets task: {e}")
@@ -748,18 +758,7 @@ def handle_test_tickets_uat(
         uat_url=uat_url
     )
 
-    # Post UAT URL to issue
-    github.create_issue_comment(
-        repo_full_name,
-        issue_number,
-        f"<!-- claude-agent -->\n**UAT Environment Starting**\n\n"
-        f"URL: {uat_url}\n\n"
-        f"Branch: `{branch_name}`\n"
-        f"Session: `{session_id}`\n\n"
-        f"The environment will be available shortly. "
-        f"Authentication uses staging (`app.teammobot.dev`).\n\n"
-        f"To stop this UAT, close the issue or remove the `{TEST_TICKETS_TRIGGER_LABEL}` label."
-    )
+    # Comment will be posted by the container once fully started
 
     logger.info(f"test_tickets UAT session {session_id} started successfully")
     return {
@@ -803,16 +802,20 @@ def handle_pr_labeled(
             "body": json.dumps({"message": "Not test_tickets repo"})
         }
 
-    # Check for either uat or claude-dev label
+    # Check for uat, uat-staging, or claude-dev label
     is_uat = label_name == TEST_TICKETS_TRIGGER_LABEL
+    is_staging = label_name == TEST_TICKETS_STAGING_LABEL
     is_claude_dev = label_name == TEST_TICKETS_CLAUDE_LABEL
 
-    if not (is_uat or is_claude_dev):
+    if not (is_uat or is_staging or is_claude_dev):
         logger.info(f"Ignoring label: {label_name}")
         return {
             "statusCode": 200,
-            "body": json.dumps({"message": "Not uat or claude-dev label"})
+            "body": json.dumps({"message": "Not uat, uat-staging, or claude-dev label"})
         }
+
+    # Determine image tag: staging label uses :staging, others use :latest
+    image_tag = "staging" if is_staging else "latest"
 
     if not TEST_TICKETS_TASK_DEFINITION:
         logger.error("TEST_TICKETS_TASK_DEFINITION not configured")
@@ -833,7 +836,7 @@ def handle_pr_labeled(
             "body": json.dumps({"error": "No branch found"})
         }
 
-    logger.info(f"Starting test_tickets UAT for PR #{pr_number} branch {branch_name} (claude_dev={is_claude_dev})")
+    logger.info(f"Starting test_tickets UAT for PR #{pr_number} branch {branch_name} (claude_dev={is_claude_dev}, image_tag={image_tag})")
 
     # Create session ID (sanitize branch name for subdomain)
     safe_branch = branch_name.replace("/", "-").replace("_", "-").lower()
@@ -887,14 +890,15 @@ Commit your work when complete and push to the remote branch."""
         logger.info(f"Queuing initial prompt for claude-dev: {initial_prompt[:100]}...")
 
     # Launch test_tickets ECS task
-    logger.info(f"Launching test_tickets ECS task for session {session_id}")
+    logger.info(f"Launching test_tickets ECS task for session {session_id} (image_tag={image_tag})")
     try:
         task_arn = ecs.launch_test_tickets_task(
             session_id=session_id,
             branch=branch_name,
             pr_number=pr_number,
             repo=repo_full_name,
-            github_token=github.get_token()
+            github_token=github.get_token(),
+            image_tag=image_tag
         )
     except Exception as e:
         logger.error(f"Failed to launch test_tickets task: {e}")
@@ -922,32 +926,9 @@ Commit your work when complete and push to the remote branch."""
         initial_prompt=initial_prompt
     )
 
-    # Post UAT URL to PR with appropriate message
-    if is_claude_dev:
-        comment = (
-            f"<!-- claude-agent -->\n**UAT + Claude Agent Starting**\n\n"
-            f"URL: {uat_url}\n\n"
-            f"Branch: `{branch_name}`\n"
-            f"Session: `{session_id}`\n\n"
-            f"The environment will be available shortly. "
-            f"Claude will automatically start implementing the PR description.\n\n"
-            f"Comment on this PR to provide feedback or additional instructions.\n\n"
-            f"To stop, close the PR or remove the `{TEST_TICKETS_CLAUDE_LABEL}` label."
-        )
-    else:
-        comment = (
-            f"<!-- claude-agent -->\n**UAT Environment Starting**\n\n"
-            f"URL: {uat_url}\n\n"
-            f"Branch: `{branch_name}`\n"
-            f"Session: `{session_id}`\n\n"
-            f"The environment will be available shortly. "
-            f"Authentication uses staging (`app.teammobot.dev`).\n\n"
-            f"To stop this UAT, close the PR or remove the `{TEST_TICKETS_TRIGGER_LABEL}` label."
-        )
+    # Comment will be posted by the container once fully started
 
-    github.create_issue_comment(repo_full_name, pr_number, comment)
-
-    logger.info(f"test_tickets UAT session {session_id} started from PR (claude_dev={is_claude_dev})")
+    logger.info(f"test_tickets UAT session {session_id} started from PR (claude_dev={is_claude_dev}, image_tag={image_tag})")
     return {
         "statusCode": 200,
         "body": json.dumps({
@@ -955,7 +936,8 @@ Commit your work when complete and push to the remote branch."""
             "session_id": session_id,
             "uat_url": uat_url,
             "task_arn": task_arn,
-            "claude_dev": is_claude_dev
+            "claude_dev": is_claude_dev,
+            "image_tag": image_tag
         })
     }
 
@@ -989,27 +971,28 @@ def handle_pr_unlabeled_or_closed(
             "body": json.dumps({"message": "Not test_tickets repo"})
         }
 
-    # For unlabeled events, only handle 'uat' or 'claude-dev' label removal
+    # For unlabeled events, only handle 'uat', 'uat-staging', or 'claude-dev' label removal
     if action == "unlabeled":
         removed_label = label.get("name")
-        if removed_label not in (TEST_TICKETS_TRIGGER_LABEL, TEST_TICKETS_CLAUDE_LABEL):
+        if removed_label not in (TEST_TICKETS_TRIGGER_LABEL, TEST_TICKETS_STAGING_LABEL, TEST_TICKETS_CLAUDE_LABEL):
             return {
                 "statusCode": 200,
-                "body": json.dumps({"message": "Not uat or claude-dev label"})
+                "body": json.dumps({"message": "Not uat, uat-staging, or claude-dev label"})
             }
 
-    # For closed events, check if the PR had either uat or claude-dev label
+    # For closed events, check if the PR had uat, uat-staging, or claude-dev label
     if action == "closed":
         labels = pr.get("labels", [])
         label_names = [l.get("name") for l in labels]
         has_trigger_label = (
             TEST_TICKETS_TRIGGER_LABEL in label_names or
+            TEST_TICKETS_STAGING_LABEL in label_names or
             TEST_TICKETS_CLAUDE_LABEL in label_names
         )
         if not has_trigger_label:
             return {
                 "statusCode": 200,
-                "body": json.dumps({"message": "PR did not have uat or claude-dev label"})
+                "body": json.dumps({"message": "PR did not have uat, uat-staging, or claude-dev label"})
             }
 
     # Derive session_id from branch name (same logic as handle_pr_labeled)

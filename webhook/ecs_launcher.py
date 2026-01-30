@@ -28,6 +28,10 @@ class ECSLauncher:
         self.sessions_table = os.environ.get("SESSIONS_TABLE")
         # test_tickets specific configuration
         self.test_tickets_task_definition = os.environ.get("TEST_TICKETS_TASK_DEFINITION", "")
+        self.test_tickets_image_uri = os.environ.get(
+            "TEST_TICKETS_IMAGE_URI",
+            "678954237808.dkr.ecr.us-east-1.amazonaws.com/test-tickets-uat"
+        )
         self._ecs_client = None
 
     @property
@@ -188,7 +192,8 @@ class ECSLauncher:
         branch: str,
         pr_number: int,
         repo: str,
-        github_token: str = ""
+        github_token: str = "",
+        image_tag: str = "latest"
     ) -> str:
         """
         Launch an ECS task for test_tickets UAT environment.
@@ -202,6 +207,7 @@ class ECSLauncher:
             pr_number: PR/issue number for reference
             repo: Repository full name (owner/repo)
             github_token: GitHub token for cloning the repository
+            image_tag: Docker image tag to use (default: "latest", use "staging" for testing)
 
         Returns:
             Task ARN
@@ -224,11 +230,16 @@ class ECSLauncher:
             {"name": "REPO", "value": repo},
             {"name": "SESSIONS_TABLE", "value": self.sessions_table or ""},
             {"name": "GITHUB_TOKEN", "value": github_token},
+            {"name": "UAT_DOMAIN_SUFFIX", "value": self.uat_domain_suffix},
         ]
+
+        # Construct the full image URI with tag
+        image_uri = f"{self.test_tickets_image_uri}:{image_tag}"
 
         logger.info(f"Launching test_tickets task for session {session_id}")
         logger.info(f"  Cluster: {self.cluster}")
         logger.info(f"  Task Definition: {self.test_tickets_task_definition}")
+        logger.info(f"  Image: {image_uri}")
         logger.info(f"  Branch: {branch}")
 
         response = self.ecs.run_task(
@@ -246,7 +257,8 @@ class ECSLauncher:
                 "containerOverrides": [
                     {
                         "name": "test-tickets",
-                        "environment": env_overrides
+                        "environment": env_overrides,
+                        "image": image_uri
                     }
                 ]
             },
@@ -254,7 +266,8 @@ class ECSLauncher:
                 {"key": "SessionId", "value": session_id},
                 {"key": "AppType", "value": "test-tickets"},
                 {"key": "Branch", "value": branch},
-                {"key": "PRNumber", "value": str(pr_number)}
+                {"key": "PRNumber", "value": str(pr_number)},
+                {"key": "ImageTag", "value": image_tag}
             ]
         )
 

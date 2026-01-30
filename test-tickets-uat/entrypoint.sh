@@ -241,6 +241,47 @@ except Exception as e:
         --expression-attribute-names '{"#st": "status"}' \
         --expression-attribute-values "{\":ip\": {\"S\": \"$CONTAINER_IP\"}, \":status\": {\"S\": \"RUNNING\"}, \":tg\": {\"S\": \"${SESSION_TG_ARN:-$TARGET_GROUP_ARN}\"}}" \
         2>/dev/null && echo "  Updated DynamoDB session" || echo "  Warning: Could not update DynamoDB"
+
+    # Post "UAT Environment Started" comment to GitHub
+    if [ -n "$GITHUB_TOKEN" ] && [ -n "$REPO" ] && [ -n "$PR_NUMBER" ]; then
+        UAT_URL="https://${SESSION_ID}.${UAT_DOMAIN_SUFFIX:-uat.teammobot.dev}"
+
+        # Check if this is a claude-dev session by looking for initial_prompt in DynamoDB
+        INITIAL_PROMPT=$(aws dynamodb get-item \
+            --table-name "$SESSIONS_TABLE" \
+            --key "{\"session_id\": {\"S\": \"$SESSION_ID\"}}" \
+            --projection-expression "initial_prompt" \
+            --query 'Item.initial_prompt.S' \
+            --output text 2>/dev/null)
+
+        if [ -n "$INITIAL_PROMPT" ] && [ "$INITIAL_PROMPT" != "None" ]; then
+            COMMENT_BODY="<!-- claude-agent -->\n**UAT + Claude Agent Started**\n\n\
+URL: ${UAT_URL}\n\n\
+Branch: \`${BRANCH:-main}\`\n\
+Session: \`${SESSION_ID}\`\n\n\
+The environment is now available. \
+Claude will automatically start implementing the PR description.\n\n\
+Comment on this PR to provide feedback or additional instructions.\n\n\
+To stop, close the PR or remove the \`claude-dev\` label."
+        else
+            COMMENT_BODY="<!-- claude-agent -->\n**UAT Environment Started**\n\n\
+URL: ${UAT_URL}\n\n\
+Branch: \`${BRANCH:-main}\`\n\
+Session: \`${SESSION_ID}\`\n\n\
+The environment is now available. \
+Authentication uses staging (\`app.teammobot.dev\`).\n\n\
+To stop this UAT, close the issue/PR or remove the \`uat\` label."
+        fi
+
+        echo "  Posting UAT started comment to GitHub..."
+        curl -s -X POST \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"body\": \"$(echo -e "$COMMENT_BODY")\"}" \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            > /dev/null 2>&1 && echo "  Posted UAT started comment" || echo "  Warning: Could not post comment"
+    fi
 else
     echo "  Warning: SESSIONS_TABLE or SESSION_ID not set, skipping registration"
 fi

@@ -212,8 +212,8 @@ class ChronologicalCommentPoster {
       ? result.substring(0, 1000) + '...(truncated)'
       : result;
 
-    // Group tool call and result together
-    let formatted = `**🔧 ${toolName}**\n\`\`\`json\n${toolInput}\n\`\`\`\n\n**Result:**\n\`\`\`\n${truncatedResult}\n\`\`\``;
+    // Group tool call and result together, with result folded in a <details> tag
+    let formatted = `<details>\n<summary><strong>🔧 ${toolName}</strong></summary>\n\n\`\`\`json\n${toolInput}\n\`\`\`\n\n**Result:**\n\`\`\`\n${truncatedResult}\n\`\`\`\n</details>`;
 
     this.queueEvent(formatted);
     delete this.pendingToolUses[toolUseId];
