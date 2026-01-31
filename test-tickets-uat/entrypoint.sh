@@ -246,13 +246,17 @@ except Exception as e:
     if [ -n "$GITHUB_TOKEN" ] && [ -n "$REPO" ] && [ -n "$PR_NUMBER" ]; then
         UAT_URL="https://${SESSION_ID}.${UAT_DOMAIN_SUFFIX:-uat.teammobot.dev}"
 
-        # Check if this is a claude-dev session by looking for initial_prompt in DynamoDB
-        INITIAL_PROMPT=$(aws dynamodb get-item \
+        # Check session details from DynamoDB (initial_prompt, source, jira_issue_key)
+        SESSION_DETAILS=$(aws dynamodb get-item \
             --table-name "$SESSIONS_TABLE" \
             --key "{\"session_id\": {\"S\": \"$SESSION_ID\"}}" \
-            --projection-expression "initial_prompt" \
-            --query 'Item.initial_prompt.S' \
-            --output text 2>/dev/null)
+            --projection-expression "initial_prompt, #src, jira_issue_key" \
+            --expression-attribute-names '{"#src": "source"}' \
+            --output json 2>/dev/null)
+
+        INITIAL_PROMPT=$(echo "$SESSION_DETAILS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Item',{}).get('initial_prompt',{}).get('S',''))" 2>/dev/null)
+        SESSION_SOURCE=$(echo "$SESSION_DETAILS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Item',{}).get('source',{}).get('S','github'))" 2>/dev/null)
+        JIRA_ISSUE_KEY=$(echo "$SESSION_DETAILS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Item',{}).get('jira_issue_key',{}).get('S',''))" 2>/dev/null)
 
         if [ -n "$INITIAL_PROMPT" ] && [ "$INITIAL_PROMPT" != "None" ]; then
             COMMENT_BODY=$(cat <<EOF
@@ -303,6 +307,72 @@ EOF
         else
             echo "  Warning: GitHub API returned $HTTP_CODE"
             echo "  Response: $(echo "$HTTP_RESPONSE" | head -n1 | cut -c1-200)"
+        fi
+
+        # Post to JIRA if this is a JIRA-triggered session
+        if [ "$SESSION_SOURCE" = "jira" ] && [ -n "$JIRA_ISSUE_KEY" ]; then
+            echo "  Posting UAT ready comment to JIRA issue $JIRA_ISSUE_KEY..."
+
+            # Get JIRA credentials from Secrets Manager
+            JIRA_SECRET=$(aws secretsmanager get-secret-value \
+                --secret-id "claude-cloud-agent/jira" \
+                --query 'SecretString' \
+                --output text 2>/dev/null)
+
+            if [ -n "$JIRA_SECRET" ]; then
+                JIRA_BASE_URL=$(echo "$JIRA_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin).get('base_url',''))")
+                JIRA_EMAIL=$(echo "$JIRA_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin).get('email',''))")
+                JIRA_TOKEN=$(echo "$JIRA_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin).get('api_token',''))")
+
+                PR_URL="https://github.com/${REPO}/pull/${PR_NUMBER}"
+
+                # Build ADF comment body
+                JIRA_COMMENT=$(cat <<JIRA_EOF
+{
+    "body": {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "UAT Environment Ready", "marks": [{"type": "strong"}]}
+                ]
+            },
+            {
+                "type": "bulletList",
+                "content": [
+                    {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "UAT URL: ", "marks": [{"type": "strong"}]}, {"type": "text", "text": "${UAT_URL}"}]}]},
+                    {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "GitHub PR: ", "marks": [{"type": "strong"}]}, {"type": "text", "text": "${PR_URL}"}]}]},
+                    {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Branch: ", "marks": [{"type": "strong"}]}, {"type": "text", "text": "${BRANCH:-main}"}]}]}
+                ]
+            },
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "The UAT environment is ready for testing.", "marks": [{"type": "em"}]}
+                ]
+            }
+        ]
+    }
+}
+JIRA_EOF
+)
+
+                JIRA_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+                    -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+                    -H "Content-Type: application/json" \
+                    -d "$JIRA_COMMENT" \
+                    "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_ISSUE_KEY}/comment" 2>&1)
+                JIRA_HTTP_CODE=$(echo "$JIRA_RESPONSE" | tail -n1)
+                if [ "$JIRA_HTTP_CODE" = "201" ]; then
+                    echo "  Posted UAT ready comment to JIRA"
+                else
+                    echo "  Warning: JIRA API returned $JIRA_HTTP_CODE"
+                fi
+            else
+                echo "  Warning: Could not get JIRA secret"
+            fi
         fi
     fi
 else

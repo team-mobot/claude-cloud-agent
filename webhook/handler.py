@@ -19,12 +19,14 @@ import boto3
 from github_client import GitHubClient
 from session_manager import SessionManager
 from ecs_launcher import ECSLauncher
+from jira_client import JiraClient
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Environment variables
 GITHUB_APP_SECRET_ARN = os.environ.get("GITHUB_APP_SECRET_ARN")
+JIRA_SECRET_ARN = os.environ.get("JIRA_SECRET_ARN")
 SESSIONS_TABLE = os.environ.get("SESSIONS_TABLE")
 UAT_DOMAIN_SUFFIX = os.environ.get("UAT_DOMAIN_SUFFIX", "uat.teammobot.dev")
 TEST_TICKETS_TASK_DEFINITION = os.environ.get("TEST_TICKETS_TASK_DEFINITION", "")
@@ -43,6 +45,7 @@ TEST_TICKETS_REPO = "team-mobot/test_tickets"
 # Lazy-loaded clients and secrets
 _secrets_client = None
 _github_app_secret = None
+_jira_secret = None
 
 
 def get_secrets_client():
@@ -78,6 +81,18 @@ def get_github_app_id() -> str:
     return get_github_app_secret()["app_id"]
 
 
+def get_jira_secret() -> dict:
+    """Retrieve JIRA secret from Secrets Manager (cached)."""
+    global _jira_secret
+    if _jira_secret is None:
+        if not JIRA_SECRET_ARN:
+            raise ValueError("JIRA_SECRET_ARN not configured")
+        client = get_secrets_client()
+        response = client.get_secret_value(SecretId=JIRA_SECRET_ARN)
+        _jira_secret = json.loads(response["SecretString"])
+    return _jira_secret
+
+
 def verify_signature(payload: bytes, signature: str) -> bool:
     """
     Verify GitHub webhook signature.
@@ -96,6 +111,58 @@ def verify_signature(payload: bytes, signature: str) -> bool:
     ).hexdigest()
 
     return hmac.compare_digest(expected_sig, signature)
+
+
+def verify_jira_signature(payload: bytes, signature: str) -> bool:
+    """
+    Verify JIRA webhook signature.
+
+    JIRA sends signature in x-hub-signature header with format: sha256=<hex_digest>
+    """
+    if not signature or not signature.startswith("sha256="):
+        logger.warning("Invalid JIRA signature format")
+        return False
+
+    secret = get_jira_secret()["webhook_secret"]
+    expected_sig = "sha256=" + hmac.new(
+        secret.encode("utf-8"),
+        payload,
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(expected_sig, signature)
+
+
+def extract_text_from_adf(adf) -> str:
+    """
+    Extract plain text from Atlassian Document Format (ADF).
+
+    JIRA uses ADF for rich text fields like issue descriptions.
+    Handles both ADF (dict) and plain text (str) formats.
+    """
+    # Handle plain text string
+    if isinstance(adf, str):
+        return adf
+
+    # Handle None or empty
+    if not adf:
+        return ""
+
+    # Handle ADF format
+    if not isinstance(adf, dict) or adf.get("type") != "doc":
+        return str(adf) if adf else ""
+
+    texts = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("type") == "text":
+                texts.append(node.get("text", ""))
+            for child in node.get("content", []):
+                walk(child)
+
+    walk(adf)
+    return " ".join(texts)
 
 
 def is_bot_comment(author: str, body: str) -> bool:
@@ -128,7 +195,11 @@ def lambda_handler(event: dict, context: Any) -> dict:
         import base64
         body = base64.b64decode(body).decode("utf-8")
 
-    # Verify webhook signature
+    # Check if this is a JIRA webhook (identified by Atlassian header)
+    if headers.get("x-atlassian-webhook-identifier"):
+        return handle_jira_webhook(headers, body)
+
+    # Verify GitHub webhook signature
     signature = headers.get("x-hub-signature-256", "")
     if not verify_signature(body.encode("utf-8"), signature):
         logger.error("Webhook signature verification failed")
@@ -334,7 +405,9 @@ URL will be posted when the agent is ready.
         initial_prompt=f"Issue #{issue_number}: {issue_title}\n\n{issue_body}",
         github_token=github.get_token(),
         installation_id=payload.get("installation", {}).get("id", 0),
-        repo_full_name=repo_full_name
+        repo_full_name=repo_full_name,
+        source="github",
+        github_secret_arn=GITHUB_APP_SECRET_ARN
     )
 
     # Update session with task ARN
@@ -1054,5 +1127,323 @@ def handle_pr_unlabeled_or_closed(
         "body": json.dumps({
             "message": "UAT session stopped",
             "session_id": session_id
+        })
+    }
+
+
+# =============================================================================
+# JIRA Webhook Handlers
+# =============================================================================
+
+
+def handle_jira_webhook(headers: dict, body: str) -> dict:
+    """
+    Handle incoming JIRA webhook.
+
+    Routes to appropriate handler based on webhookEvent type.
+    """
+    logger.info("Processing JIRA webhook")
+
+    # Verify JIRA signature
+    signature = headers.get("x-hub-signature", "")
+    if not verify_jira_signature(body.encode("utf-8"), signature):
+        logger.error("JIRA webhook signature verification failed")
+        return {
+            "statusCode": 401,
+            "body": json.dumps({"error": "Invalid JIRA signature"})
+        }
+
+    # Parse payload
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JIRA webhook payload: {e}")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"error": "Invalid JSON"})
+        }
+
+    webhook_event = payload.get("webhookEvent", "")
+    logger.info(f"JIRA webhook event: {webhook_event}")
+
+    # Route based on event type
+    if webhook_event == "jira:issue_updated":
+        # Check if this is a label change
+        changelog = payload.get("changelog", {})
+        items = changelog.get("items", [])
+
+        for item in items:
+            if item.get("field") == "labels":
+                from_labels = set((item.get("fromString") or "").split())
+                to_labels = set((item.get("toString") or "").split())
+                added_labels = to_labels - from_labels
+
+                if TRIGGER_LABEL in added_labels:
+                    return handle_jira_issue_labeled(payload)
+
+        logger.info("JIRA issue updated but not a claude-dev label addition")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Not a trigger event"})
+        }
+
+    logger.info(f"Ignoring JIRA webhook event: {webhook_event}")
+    return {
+        "statusCode": 200,
+        "body": json.dumps({"message": "Event ignored"})
+    }
+
+
+def handle_jira_issue_labeled(payload: dict) -> dict:
+    """
+    Handle JIRA issue labeled with claude-dev.
+
+    Creates a GitHub branch/PR and starts an agent session,
+    similar to the GitHub issue labeled flow.
+    """
+    import uuid
+
+    issue = payload.get("issue", {})
+    issue_key = issue.get("key", "")
+    project_key = issue.get("fields", {}).get("project", {}).get("key", "")
+    issue_summary = issue.get("fields", {}).get("summary", "")
+
+    # Get issue description (ADF format)
+    description_adf = issue.get("fields", {}).get("description")
+    issue_description = extract_text_from_adf(description_adf) if description_adf else ""
+
+    logger.info(f"Starting session for JIRA issue {issue_key} in project {project_key}")
+
+    # Get JIRA secret with project mapping
+    try:
+        jira_secret = get_jira_secret()
+    except ValueError as e:
+        logger.error(f"JIRA not configured: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": "JIRA not configured"})
+        }
+
+    project_mapping = jira_secret.get("project_mapping", {})
+    repo_full_name = project_mapping.get(project_key)
+
+    if not repo_full_name:
+        logger.error(f"No GitHub repo mapped for JIRA project {project_key}")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"error": f"No repo mapping for project {project_key}"})
+        }
+
+    logger.info(f"Mapped JIRA project {project_key} to GitHub repo {repo_full_name}")
+
+    # Get GitHub App installation for this repo
+    # We use the default installation ID from the GitHub App secret
+    github_secret = get_github_app_secret()
+    installation_id = github_secret.get("default_installation_id") or github_secret.get("installation_id")
+
+    if not installation_id:
+        logger.error("No GitHub App installation ID in secret (check default_installation_id)")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": "GitHub App installation not configured"})
+        }
+
+    # Initialize clients
+    github = GitHubClient(
+        app_id=get_github_app_id(),
+        private_key=get_github_private_key(),
+        installation_id=installation_id
+    )
+    sessions = SessionManager(table_name=SESSIONS_TABLE)
+    ecs = ECSLauncher()
+
+    # Create branch name using JIRA issue key
+    branch_name = f"claude/{issue_key.lower()}"
+
+    # Check for existing session
+    # Use a synthetic issue number based on JIRA key hash for lookups
+    jira_issue_number = abs(hash(issue_key)) % 1000000
+
+    existing = sessions.get_session_by_pr(repo_full_name, jira_issue_number)
+    if existing and existing.get("status") in ("STARTING", "RUNNING"):
+        logger.info(f"Session already exists for {issue_key}: {existing['session_id']}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Session already exists",
+                "session_id": existing["session_id"],
+                "jira_issue_key": issue_key
+            })
+        }
+
+    # Get default branch for repo
+    try:
+        # Use GitHub API to get repo info for default branch
+        repo_info = github._request("GET", f"/repos/{repo_full_name}")
+        default_branch = repo_info.get("default_branch", "main")
+        repo_clone_url = repo_info.get("clone_url", f"https://github.com/{repo_full_name}.git")
+    except Exception as e:
+        logger.error(f"Failed to get repo info: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Failed to get repo info: {e}"})
+        }
+
+    # Create branch from default branch
+    logger.info(f"Creating branch {branch_name} from {default_branch}")
+    try:
+        github.create_branch(repo_full_name, branch_name, default_branch)
+    except Exception as e:
+        # Branch might already exist, try to continue
+        logger.warning(f"Failed to create branch (may already exist): {e}")
+
+    # Create initial commit (required for PR creation)
+    session_id = str(uuid.uuid4())[:8]
+    session_file_content = f"""# Claude Agent Session
+
+Session ID: {session_id}
+JIRA Issue: {issue_key}
+Repository: {repo_full_name}
+Created: {__import__('datetime').datetime.utcnow().isoformat()}Z
+
+This file tracks the Claude Cloud Agent session working on this branch.
+"""
+    logger.info(f"Creating initial commit on {branch_name}")
+    try:
+        github.create_or_update_file(
+            repo_full_name,
+            ".claude-session",
+            f"chore: initialize Claude agent session for {issue_key}",
+            session_file_content,
+            branch_name
+        )
+    except Exception as e:
+        logger.warning(f"Failed to create session file (may already exist): {e}")
+
+    # Create draft PR
+    jira_base_url = jira_secret.get("base_url", "https://atlassian.net")
+    jira_issue_url = f"{jira_base_url}/browse/{issue_key}"
+
+    pr_title = f"[Claude] {issue_key}: {issue_summary}"
+    pr_body = f"""## Automated Implementation
+
+This PR was created by Claude Cloud Agent to implement JIRA issue [{issue_key}]({jira_issue_url}).
+
+### Original Issue
+**{issue_summary}**
+
+{issue_description}
+
+### UAT Preview
+URL will be posted when the agent is ready.
+
+---
+*This PR is being worked on by an automated agent. Comment on this PR to provide feedback.*
+
+<!-- claude-agent -->
+"""
+
+    logger.info(f"Creating draft PR: {pr_title}")
+    try:
+        pr = github.create_pull_request(
+            repo_full_name,
+            title=pr_title,
+            body=pr_body,
+            head=branch_name,
+            base=default_branch,
+            draft=True
+        )
+        pr_number = pr["number"]
+    except Exception as e:
+        logger.error(f"Failed to create PR: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Failed to create PR: {e}"})
+        }
+
+    # Create session record with JIRA tracking
+    logger.info(f"Creating session {session_id}")
+    sessions.create_session(
+        session_id=session_id,
+        repo_full_name=repo_full_name,
+        issue_number=jira_issue_number,
+        pr_number=pr_number,
+        branch_name=branch_name,
+        source="jira",
+        jira_issue_key=issue_key
+    )
+
+    # Launch ECS task
+    initial_prompt = f"""JIRA Issue {issue_key}: {issue_summary}
+
+{issue_description}
+
+Implement the requirements described above. When complete, commit and push your changes."""
+
+    # Extract JIRA site hostname from base_url (e.g., "https://teammobot.atlassian.net" -> "teammobot.atlassian.net")
+    jira_base_url = jira_secret.get("base_url", "")
+    jira_site = jira_base_url.replace("https://", "").replace("http://", "").rstrip("/")
+
+    logger.info(f"Launching ECS task for session {session_id}")
+    try:
+        task_arn = ecs.launch_agent_task(
+            session_id=session_id,
+            repo_clone_url=repo_clone_url,
+            branch_name=branch_name,
+            issue_number=jira_issue_number,
+            pr_number=pr_number,
+            initial_prompt=initial_prompt,
+            github_token=github.get_token(),
+            installation_id=installation_id,
+            repo_full_name=repo_full_name,
+            source="jira",
+            jira_issue_key=issue_key,
+            jira_site=jira_site,
+            jira_secret_arn=JIRA_SECRET_ARN,
+            github_secret_arn=GITHUB_APP_SECRET_ARN
+        )
+    except Exception as e:
+        logger.error(f"Failed to launch ECS task: {e}")
+        sessions.update_session(session_id, status="FAILED")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Failed to launch task: {e}"})
+        }
+
+    # Update session with task ARN
+    sessions.update_session(session_id, task_arn=task_arn)
+
+    # Post comment to JIRA issue with link to GitHub PR
+    try:
+        jira = JiraClient(
+            base_url=jira_secret.get("base_url"),
+            email=jira_secret.get("email"),
+            api_token=jira_secret.get("api_token")
+        )
+        pr_url = f"https://github.com/{repo_full_name}/pull/{pr_number}"
+        jira.add_formatted_comment(
+            issue_key=issue_key,
+            title="Claude Agent Started",
+            fields={
+                "GitHub PR": pr_url,
+                "Session ID": session_id,
+                "Branch": branch_name
+            },
+            footer="Follow progress and provide feedback on the GitHub PR."
+        )
+        logger.info(f"Posted JIRA comment for {issue_key}")
+    except Exception as e:
+        logger.warning(f"Failed to post JIRA comment: {e}")
+        # Don't fail the request if JIRA comment fails
+
+    logger.info(f"Session {session_id} started successfully for JIRA {issue_key}")
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "Session started",
+            "session_id": session_id,
+            "jira_issue_key": issue_key,
+            "pr_number": pr_number,
+            "task_arn": task_arn
         })
     }

@@ -51,7 +51,12 @@ class ECSLauncher:
         initial_prompt: str,
         github_token: str = "",
         installation_id: int = 0,
-        repo_full_name: str = ""
+        repo_full_name: str = "",
+        source: str = "github",
+        jira_issue_key: str = "",
+        jira_site: str = "",
+        jira_secret_arn: str = "",
+        github_secret_arn: str = ""
     ) -> str:
         """
         Launch an ECS task for an agent session.
@@ -66,23 +71,48 @@ class ECSLauncher:
             github_token: GitHub installation token for cloning
             installation_id: GitHub App installation ID for token refresh
             repo_full_name: Repository full name (owner/repo)
+            source: Trigger source ("github" or "jira")
+            jira_issue_key: JIRA issue key if source is jira
+            jira_site: JIRA site hostname (e.g., "teammobot.atlassian.net")
+            jira_secret_arn: ARN for JIRA credentials secret
+            github_secret_arn: ARN for GitHub App secret
 
         Returns:
             Task ARN
         """
         # Build environment overrides
+        # Use variable names expected by the agent container
         env_overrides = [
             {"name": "SESSION_ID", "value": session_id},
+            {"name": "REPO", "value": repo_full_name},
+            {"name": "BRANCH", "value": branch_name},
+            {"name": "PR_NUMBER", "value": str(pr_number)},
+            {"name": "PROMPT", "value": initial_prompt},
+            {"name": "SOURCE", "value": source},
+            {"name": "SESSION_TABLE", "value": self.sessions_table or ""},
+            {"name": "SESSIONS_TABLE", "value": self.sessions_table or ""},
+            {"name": "UAT_DOMAIN_SUFFIX", "value": self.uat_domain_suffix},
+            # Legacy variable names for backwards compatibility
             {"name": "REPO_CLONE_URL", "value": repo_clone_url},
             {"name": "BRANCH_NAME", "value": branch_name},
             {"name": "ISSUE_NUMBER", "value": str(issue_number)},
-            {"name": "PR_NUMBER", "value": str(pr_number)},
             {"name": "INITIAL_PROMPT", "value": initial_prompt},
-            {"name": "UAT_DOMAIN_SUFFIX", "value": self.uat_domain_suffix},
             {"name": "GITHUB_TOKEN", "value": github_token},
             {"name": "GITHUB_INSTALLATION_ID", "value": str(installation_id)},
             {"name": "REPO_FULL_NAME", "value": repo_full_name}
         ]
+
+        # Add JIRA variables if this is a JIRA-triggered session
+        if source == "jira":
+            env_overrides.extend([
+                {"name": "JIRA_ISSUE_KEY", "value": jira_issue_key},
+                {"name": "JIRA_SITE", "value": jira_site},
+                {"name": "JIRA_SECRET_ARN", "value": jira_secret_arn}
+            ])
+
+        # Add GitHub secret ARN if provided
+        if github_secret_arn:
+            env_overrides.append({"name": "GITHUB_SECRET_ARN", "value": github_secret_arn})
 
         logger.info(f"Launching task for session {session_id}")
         logger.info(f"  Cluster: {self.cluster}")
@@ -103,7 +133,7 @@ class ECSLauncher:
             overrides={
                 "containerOverrides": [
                     {
-                        "name": "agent",
+                        "name": "claude-agent",
                         "environment": env_overrides
                     }
                 ]

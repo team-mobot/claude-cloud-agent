@@ -59,7 +59,9 @@ class SessionManager:
         repo_full_name: str,
         issue_number: int,
         pr_number: int,
-        branch_name: str
+        branch_name: str,
+        source: str = "github",
+        jira_issue_key: Optional[str] = None
     ) -> dict:
         """
         Create a new session.
@@ -70,6 +72,8 @@ class SessionManager:
             issue_number: Source issue number
             pr_number: Created PR number
             branch_name: Feature branch name
+            source: Trigger source ("github" or "jira")
+            jira_issue_key: JIRA issue key if triggered from JIRA (e.g., "AGNTS-118")
 
         Returns:
             Created session record
@@ -83,12 +87,16 @@ class SessionManager:
             "pr_number": pr_number,
             "branch_name": branch_name,
             "status": "STARTING",
+            "source": source,
             "created_at": now,
             "updated_at": now
         }
 
+        if jira_issue_key:
+            item["jira_issue_key"] = jira_issue_key
+
         self.table.put_item(Item=item)
-        logger.info(f"Created session {session_id} for {repo_full_name} PR #{pr_number}")
+        logger.info(f"Created session {session_id} for {repo_full_name} PR #{pr_number} (source={source})")
 
         return item
 
