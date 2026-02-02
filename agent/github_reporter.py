@@ -309,15 +309,18 @@ class StreamingReporter:
 
     Groups related items:
     - Claude's text responses → posted immediately as separate comments
-    - Tool use + result → grouped together
-    - Consecutive similar tools (reads) → batched together
+    - Tool use + result → grouped together in same comment
+    - Consecutive similar tools (reads) → batched with their results
     """
 
-    # Tools that can be batched together
+    # Tools that can be batched together (read-only operations)
     BATCH_TOOLS = {"Read", "Glob", "Grep"}
 
     # Minimum time between posts to avoid rate limiting
     MIN_POST_INTERVAL = 1.0
+
+    # Maximum items in a batch before forcing a post
+    MAX_BATCH_SIZE = 6
 
     def __init__(self, github: GitHubReporter):
         """
@@ -327,9 +330,9 @@ class StreamingReporter:
             github: GitHubReporter instance for posting
         """
         self.github = github
-        self._pending_tool_use: Optional[tuple[str, str]] = None  # (tool_name, formatted)
-        self._batch_buffer: list[str] = []  # For batching similar tools
-        self._batch_tool_type: Optional[str] = None
+        self._pending_tool_uses: list[tuple[str, str]] = []  # [(tool_name, formatted), ...]
+        self._pending_results: list[str] = []  # [formatted_result, ...]
+        self._batch_mode: bool = False  # True when collecting batch tools
         self._last_post_time: float = 0
         self._lock = asyncio.Lock()
 
@@ -359,73 +362,78 @@ class StreamingReporter:
         """
         Add a tool use.
 
-        Batchable tools (Read, Glob, Grep) are collected.
-        Other tools flush the batch and wait for their result.
+        Batchable tools (Read, Glob, Grep) are collected with their results.
+        Other tools are paired 1:1 with their results.
         """
         formatted = format_tool_use(tool_name, tool_input)
 
         async with self._lock:
             if tool_name in self.BATCH_TOOLS:
-                # If switching tool types, flush first
-                if self._batch_tool_type and self._batch_tool_type != tool_name:
-                    await self._flush_batch()
+                # If we were not in batch mode and have pending items, flush first
+                if not self._batch_mode and self._pending_tool_uses:
+                    await self._flush_pending()
 
-                self._batch_tool_type = tool_name
-                self._batch_buffer.append(formatted)
+                self._batch_mode = True
+                self._pending_tool_uses.append((tool_name, formatted))
 
-                # Post batch if it gets large
-                if len(self._batch_buffer) >= 4:
-                    await self._flush_batch()
+                # Flush if batch gets too large
+                if len(self._pending_tool_uses) >= self.MAX_BATCH_SIZE:
+                    await self._flush_pending()
             else:
-                # Non-batchable tool - flush batch and store for pairing with result
-                await self._flush_batch()
-                self._pending_tool_use = (tool_name, formatted)
+                # Non-batchable tool - flush any batch and start fresh
+                await self._flush_pending()
+                self._batch_mode = False
+                self._pending_tool_uses.append((tool_name, formatted))
 
     async def add_tool_result(self, result: str, is_error: bool = False) -> None:
         """
         Add a tool result.
 
-        If there's a pending tool use, pair them together.
-        Otherwise post the result alone.
+        Results are collected and paired with their tool uses.
+        When we have all results for pending tools, post them together.
         """
         formatted = format_tool_result(result, is_error)
 
         async with self._lock:
-            if self._pending_tool_use:
-                # Pair with pending tool use
-                tool_name, tool_formatted = self._pending_tool_use
-                self._pending_tool_use = None
+            self._pending_results.append(formatted)
 
-                body = f"{tool_formatted}\n\n{formatted}"
-                await self._post(body)
-            elif self._batch_buffer:
-                # Result for batched tools - add to batch and flush
-                self._batch_buffer.append(formatted)
-                await self._flush_batch()
-            else:
-                # Orphaned result - post alone
-                await self._post(formatted)
-
-    async def _flush_batch(self) -> None:
-        """Flush the batch buffer."""
-        if not self._batch_buffer:
-            return
-
-        body = "\n\n---\n\n".join(self._batch_buffer)
-        self._batch_buffer = []
-        self._batch_tool_type = None
-        await self._post(body)
+            # Check if we have results for all pending tool uses
+            if len(self._pending_results) >= len(self._pending_tool_uses):
+                await self._flush_pending()
 
     async def _flush_pending(self) -> None:
-        """Flush any pending items."""
-        # Flush batch first
-        await self._flush_batch()
+        """Flush pending tool uses paired with their results."""
+        if not self._pending_tool_uses:
+            # Just orphaned results
+            if self._pending_results:
+                body = "\n\n---\n\n".join(self._pending_results)
+                self._pending_results = []
+                await self._post(body)
+            return
 
-        # Flush unpaired tool use (shouldn't happen often)
-        if self._pending_tool_use:
-            _, formatted = self._pending_tool_use
-            self._pending_tool_use = None
-            await self._post(formatted)
+        # Pair each tool use with its result
+        parts = []
+        for i, (tool_name, tool_formatted) in enumerate(self._pending_tool_uses):
+            if i < len(self._pending_results):
+                # Pair tool use with result
+                parts.append(f"{tool_formatted}\n\n{self._pending_results[i]}")
+            else:
+                # No result yet - just show tool use
+                parts.append(tool_formatted)
+
+        # Handle any extra results (shouldn't happen)
+        for i in range(len(self._pending_tool_uses), len(self._pending_results)):
+            parts.append(self._pending_results[i])
+
+        # Clear pending
+        self._pending_tool_uses = []
+        self._pending_results = []
+        self._batch_mode = False
+
+        # Post combined comment
+        if parts:
+            body = "\n\n---\n\n".join(parts)
+            await self._post(body)
 
     async def flush(self) -> None:
         """Force post any remaining items."""
