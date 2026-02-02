@@ -25,16 +25,18 @@ docs/
 
 ## GitHub App Configuration
 
-The webhook is triggered by a GitHub App. The webhook URL must point to the API Gateway endpoint:
+The webhook is triggered by a GitHub App. Use the **custom domain URL** (stable across infrastructure rebuilds):
 
 | Setting | Value |
 |---------|-------|
-| Webhook URL | `https://emolxuoaf7.execute-api.us-east-1.amazonaws.com/webhook` |
+| Webhook URL | `https://webhook.uat.teammobot.dev/webhook` |
 | Content type | `application/json` |
 | Secret | Stored in `claude-dev/github-app` Secrets Manager |
 | Events | Issues (labeled), Pull requests (labeled) |
 
 **To update:** GitHub → Settings → Developer settings → GitHub Apps → claude-dev → Webhook
+
+> **Note:** The raw API Gateway URL (`https://emolxuoaf7.execute-api.us-east-1.amazonaws.com/webhook`) also works but changes if infrastructure is destroyed/recreated. Always use the custom domain.
 
 ## Key Workflows
 
@@ -177,8 +179,10 @@ All of these resources are managed by Terraform. Do not modify manually:
 | Security Groups | `claude-cloud-agent-uat-proxy-sg`, `claude-cloud-agent-sg` |
 | IAM Roles | `claude-cloud-agent-AgentExecutionRole`, `claude-cloud-agent-AgentTaskRole`, `claude-cloud-agent-ProxyExecutionRole`, `claude-cloud-agent-UatProxyTaskRole`, `claude-cloud-agent-WebhookLambdaRole`, `claude-agent-idle-timeout-role` |
 | CloudWatch Log Groups | `/ecs/claude-cloud-agent`, `/ecs/claude-cloud-agent-uat-proxy`, `/aws/lambda/claude-cloud-agent-webhook`, `/aws/lambda/claude-cloud-agent-idle-timeout` |
+| API Gateway Custom Domain | `webhook.uat.teammobot.dev` |
+| Route 53 Record | `webhook.uat.teammobot.dev` → API Gateway |
 
-**Webhook API Endpoint:** `https://emolxuoaf7.execute-api.us-east-1.amazonaws.com`
+**Webhook URL (stable):** `https://webhook.uat.teammobot.dev/webhook`
 
 ### Workspace Environment Variables
 
