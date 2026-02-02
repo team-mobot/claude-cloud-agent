@@ -119,6 +119,45 @@ aws dynamodb scan --table-name claude-cloud-agent-sessions
 gh pr list --repo team-mobot/test_tickets --state open
 ```
 
+## Infrastructure as Code (Terraform)
+
+The infrastructure is managed via Terraform in the mobot repo:
+
+**Location**: `/Users/dave/git/mobot/claude-cloude-agent-infra/infrastructure/aws-projects/claude-cloud-agent/`
+
+**Terraform Cloud**: https://app.terraform.io/app/mobot/workspaces
+- Workspace: `aws-projects__claude-cloud-agent`
+
+### Key Findings (2026-02-02 Audit)
+
+1. Infrastructure runs in **test-tickets VPC** (`vpc-0fde49947ce39aec4`), NOT aws0
+2. Uses existing `test-tickets-uat-alb` (DNS `*.uat.teammobot.dev` points there)
+3. Proxy env var must be `SESSIONS_TABLE` (not `SESSION_TABLE`)
+4. Security group must allow traffic from ALB SG `sg-01e33c097eb569074`
+
+### Terraform Deployment Workflow
+
+```bash
+# 1. Make changes on feature branch
+cd /Users/dave/git/mobot/claude-cloude-agent-infra
+git add infrastructure/aws-projects/claude-cloud-agent/
+git commit -m "Description"
+
+# 2. Merge to terraform-cloud branch (separate worktree)
+cd /Users/dave/git/mobot/terraform-cloud
+git merge claude-cloude-agent-infra -m "Merge description"
+
+# 3. Push to trigger Terraform Cloud
+git push origin terraform-cloud
+
+# 4. Review plan at Terraform Cloud UI
+# 5. Click "Confirm & Apply"
+```
+
+See `docs/INFRASTRUCTURE-AUDIT-2026-02-02.md` for full details.
+
+---
+
 ## Known Issues
 
 ### claude-agent Container Source
@@ -128,3 +167,7 @@ The `claude-agent` ECS container uses Python modules (`session_reporter.py`, `gi
 ### Lambda Deployment
 
 The Lambda requires Linux binaries for cryptography. Don't rebuild the zip on macOS - update the existing deployment directory that has pre-built Linux dependencies.
+
+### Infrastructure Drift (Resolved 2026-02-02)
+
+The original CloudFormation ALB was deleted outside of IaC, causing UAT proxy failures. This has been resolved by migrating to Terraform and using the existing `test-tickets-uat-alb`. See `docs/INFRASTRUCTURE-AUDIT-2026-02-02.md`.
