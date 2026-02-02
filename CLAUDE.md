@@ -5,6 +5,16 @@ Infrastructure for running Claude Code as an autonomous development agent, trigg
 ## Repository Structure
 
 ```
+agent/                    # Claude agent container (Python)
+  main.py                 # Agent orchestrator entry point
+  claude_runner.py        # Runs Claude Code CLI with streaming
+  github_reporter.py      # Posts status updates to GitHub PRs
+  session_reporter.py     # Updates DynamoDB session state
+  dev_server.py           # Manages project dev servers
+  api_server.py           # HTTP API for receiving prompts
+  Dockerfile              # Container build
+  entrypoint.sh           # Container startup
+
 webhook/                  # Lambda webhook handler
   handler.py              # Main webhook routing
   ecs_launcher.py         # ECS task launching
@@ -351,10 +361,6 @@ The `claude-cloud-agent-idle-timeout` Lambda runs every 10 minutes to stop ECS t
 ---
 
 ## Known Issues
-
-### claude-agent Container Source
-
-The `claude-agent` ECS container uses Python modules (`session_reporter.py`, `github_reporter.py`, `claude_runner.py`) but the source location is unknown. The `/Users/dave/git/cca/agent/` directory has a bash-based entrypoint that doesn't match the deployed container.
 
 ### Lambda Deployment Notes
 
