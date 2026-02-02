@@ -165,17 +165,18 @@ All of these resources are managed by Terraform. Do not modify manually:
 
 | Resource Type | Name |
 |---------------|------|
-| Lambda Function | `claude-cloud-agent-webhook` |
+| Lambda Functions | `claude-cloud-agent-webhook`, `claude-cloud-agent-idle-timeout` |
 | API Gateway HTTP API | `claude-cloud-agent-webhook` (ID: `emolxuoaf7`) |
+| EventBridge Rule | `claude-agent-idle-timeout-schedule` (runs every 10 min) |
 | ECS Cluster | `claude-cloud-agent` |
 | ECS Service | `claude-cloud-agent-uat-proxy` |
-| ECS Task Definitions | `claude-cloud-agent`, `claude-cloud-agent-uat-proxy` |
+| ECS Task Definitions | `claude-agent`, `claude-cloud-agent-uat-proxy` |
 | DynamoDB Table | `claude-cloud-agent-sessions` |
 | Target Group | `claude-cloud-agent-uat-proxy` |
 | Listener Rule | Priority 10 on `test-tickets-uat-alb` |
-| Security Groups | `claude-cloud-agent-uat-proxy`, `claude-cloud-agent-agent` |
-| IAM Roles | `claude-cloud-agent-AgentExecutionRole`, `claude-cloud-agent-AgentTaskRole`, `claude-cloud-agent-ProxyExecutionRole`, `claude-cloud-agent-UatProxyTaskRole`, `claude-cloud-agent-WebhookLambdaRole` |
-| CloudWatch Log Groups | `/ecs/claude-cloud-agent`, `/ecs/claude-cloud-agent-uat-proxy`, `/aws/lambda/claude-cloud-agent-webhook` |
+| Security Groups | `claude-cloud-agent-uat-proxy-sg`, `claude-cloud-agent-sg` |
+| IAM Roles | `claude-cloud-agent-AgentExecutionRole`, `claude-cloud-agent-AgentTaskRole`, `claude-cloud-agent-ProxyExecutionRole`, `claude-cloud-agent-UatProxyTaskRole`, `claude-cloud-agent-WebhookLambdaRole`, `claude-agent-idle-timeout-role` |
+| CloudWatch Log Groups | `/ecs/claude-cloud-agent`, `/ecs/claude-cloud-agent-uat-proxy`, `/aws/lambda/claude-cloud-agent-webhook`, `/aws/lambda/claude-cloud-agent-idle-timeout` |
 
 **Webhook API Endpoint:** `https://emolxuoaf7.execute-api.us-east-1.amazonaws.com`
 
@@ -256,16 +257,3 @@ The original CloudFormation ALB was deleted outside of IaC, causing UAT proxy fa
 4. Uses existing `test-tickets-uat-alb` (shared with test-tickets project)
 
 All infrastructure is now fully managed by Terraform Cloud workspace `aws-projects__claude-cloud-agent`.
-
-### Orphaned AWS Resources (Not Terraform-Managed)
-
-These resources exist in AWS but are NOT managed by Terraform. Consider cleanup:
-
-| Resource | Name | Notes |
-|----------|------|-------|
-| Lambda Function | `claude-cloud-agent-idle-timeout` | Old function, likely unused |
-| CloudWatch Log Group | `/aws/lambda/claude-cloud-agent-idle-timeout` | No retention set |
-| Task Definition | `claude-agent-task-dev` | Old dev task definition |
-| Task Definition | `claude-dev-agent` | Old dev task definition |
-
-To clean up, verify these are not in use, then delete manually via AWS console or CLI.
