@@ -121,14 +121,52 @@ gh pr list --repo team-mobot/test_tickets --state open
 
 ## Infrastructure as Code (Terraform)
 
-The infrastructure is managed via Terraform in the mobot repo:
+The infrastructure is fully managed via Terraform Cloud. **All infrastructure changes should go through Terraform** - do not create/modify AWS resources manually.
 
-**Location**: `/Users/dave/git/mobot/claude-cloude-agent-infra/infrastructure/aws-projects/claude-cloud-agent/`
+### Terraform Cloud Workspace
 
-**Terraform Cloud**: https://app.terraform.io/app/mobot/workspaces
-- Workspace: `aws-projects__claude-cloud-agent`
+| Setting | Value |
+|---------|-------|
+| Organization | `mobot` |
+| Workspace | `aws-projects__claude-cloud-agent` |
+| Workspace ID | `ws-3zmsw77ih3j4YVoT` |
+| URL | https://app.terraform.io/app/mobot/workspaces/aws-projects__claude-cloud-agent |
+| VCS Repo | `team-mobot/mobot` |
+| Branch | `terraform-cloud` |
+| Working Directory | `infrastructure/aws-projects/claude-cloud-agent` |
+| Terraform Version | `1.12.2` |
 
-### Key Findings (2026-02-02 Audit)
+### Terraform Source Location
+
+**Feature branch (for editing):** `/Users/dave/git/mobot/claude-cloude-agent-infra/infrastructure/aws-projects/claude-cloud-agent/`
+
+**Deploy branch (worktree):** `/Users/dave/git/mobot/terraform-cloud/infrastructure/aws-projects/claude-cloud-agent/`
+
+### Terraform-Managed Resources
+
+All of these resources are managed by Terraform. Do not modify manually:
+
+| Resource Type | Name |
+|---------------|------|
+| ECS Cluster | `claude-cloud-agent` |
+| ECS Service | `claude-cloud-agent-uat-proxy` |
+| ECS Task Definitions | `claude-cloud-agent`, `claude-cloud-agent-uat-proxy` |
+| DynamoDB Table | `claude-cloud-agent-sessions` |
+| Target Group | `claude-cloud-agent-uat-proxy` |
+| Listener Rule | Priority 10 on `test-tickets-uat-alb` |
+| Security Groups | `claude-cloud-agent-uat-proxy`, `claude-cloud-agent-agent` |
+| IAM Roles | `claude-cloud-agent-AgentExecutionRole`, `claude-cloud-agent-AgentTaskRole`, `claude-cloud-agent-ProxyExecutionRole`, `claude-cloud-agent-UatProxyTaskRole` |
+| CloudWatch Log Groups | `/ecs/claude-cloud-agent`, `/ecs/claude-cloud-agent-uat-proxy` |
+
+### Workspace Environment Variables
+
+AWS credentials are configured as **sensitive environment variables** in the Terraform Cloud workspace:
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+
+To update credentials: Go to workspace → Variables → Edit
+
+### Key Architecture Facts
 
 1. Infrastructure runs in **test-tickets VPC** (`vpc-0fde49947ce39aec4`), NOT aws0
 2. Uses existing `test-tickets-uat-alb` (DNS `*.uat.teammobot.dev` points there)
@@ -140,12 +178,13 @@ The infrastructure is managed via Terraform in the mobot repo:
 ```bash
 # 1. Make changes on feature branch
 cd /Users/dave/git/mobot/claude-cloude-agent-infra
+# edit files in infrastructure/aws-projects/claude-cloud-agent/
 git add infrastructure/aws-projects/claude-cloud-agent/
-git commit -m "Description"
+git commit -m "Description of change"
 
 # 2. Merge to terraform-cloud branch (separate worktree)
 cd /Users/dave/git/mobot/terraform-cloud
-git merge claude-cloude-agent-infra -m "Merge description"
+git merge claude-cloude-agent-infra -m "Merge: description"
 
 # 3. Push to trigger Terraform Cloud
 git push origin terraform-cloud
@@ -154,7 +193,25 @@ git push origin terraform-cloud
 # 5. Click "Confirm & Apply"
 ```
 
-See `docs/INFRASTRUCTURE-AUDIT-2026-02-02.md` for full details.
+### Using Terraform Cloud MCP
+
+Claude Code has the `terraform-cloud` MCP server configured for interacting with Terraform Cloud:
+
+```bash
+# Verify MCP server is connected
+claude mcp list
+
+# Available tools include:
+# - mcp__terraform-cloud__list_workspaces
+# - mcp__terraform-cloud__get_workspace_details
+# - mcp__terraform-cloud__create_run
+# - mcp__terraform-cloud__apply_run
+# - mcp__terraform-cloud__get_run_details
+# - mcp__terraform-cloud__get_plan_logs
+# - mcp__terraform-cloud__get_apply_logs
+```
+
+See `docs/INFRASTRUCTURE-AUDIT-2026-02-02.md` for full audit details.
 
 ---
 
@@ -168,6 +225,12 @@ The `claude-agent` ECS container uses Python modules (`session_reporter.py`, `gi
 
 The Lambda requires Linux binaries for cryptography. Don't rebuild the zip on macOS - update the existing deployment directory that has pre-built Linux dependencies.
 
-### Infrastructure Drift (Resolved 2026-02-02)
+### Infrastructure Drift (Fully Resolved 2026-02-02)
 
-The original CloudFormation ALB was deleted outside of IaC, causing UAT proxy failures. This has been resolved by migrating to Terraform and using the existing `test-tickets-uat-alb`. See `docs/INFRASTRUCTURE-AUDIT-2026-02-02.md`.
+The original CloudFormation ALB was deleted outside of IaC, causing UAT proxy failures. This has been fully resolved:
+1. Migrated all infrastructure to Terraform Cloud
+2. Tore down all manually-created resources
+3. Terraform now manages everything from scratch
+4. Uses existing `test-tickets-uat-alb` (shared with test-tickets project)
+
+All infrastructure is now fully managed by Terraform Cloud workspace `aws-projects__claude-cloud-agent`.
