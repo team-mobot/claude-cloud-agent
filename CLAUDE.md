@@ -242,3 +242,16 @@ The original CloudFormation ALB was deleted outside of IaC, causing UAT proxy fa
 4. Uses existing `test-tickets-uat-alb` (shared with test-tickets project)
 
 All infrastructure is now fully managed by Terraform Cloud workspace `aws-projects__claude-cloud-agent`.
+
+### Orphaned AWS Resources (Not Terraform-Managed)
+
+These resources exist in AWS but are NOT managed by Terraform. Consider cleanup:
+
+| Resource | Name | Notes |
+|----------|------|-------|
+| Lambda Function | `claude-cloud-agent-idle-timeout` | Old function, likely unused |
+| CloudWatch Log Group | `/aws/lambda/claude-cloud-agent-idle-timeout` | No retention set |
+| Task Definition | `claude-agent-task-dev` | Old dev task definition |
+| Task Definition | `claude-dev-agent` | Old dev task definition |
+
+To clean up, verify these are not in use, then delete manually via AWS console or CLI.
