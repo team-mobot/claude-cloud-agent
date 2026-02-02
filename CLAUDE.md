@@ -360,6 +360,19 @@ The `claude-agent` ECS container uses Python modules (`session_reporter.py`, `gi
 
 The Lambda requires Linux binaries for cryptography. The deployment directory at `/Users/dave/git/claude-cloud-agent/version-two/webhook-deploy/` contains pre-built Linux dependencies. Never rebuild from scratch on macOS - always copy Python files to this directory and create the zip from there.
 
+### VITE_GOOGLE_CLIENT_ID Configuration (Fixed 2026-02-02)
+
+The `test-tickets-uat` container requires `GOOGLE_CLIENT_ID` for Vite's Google OAuth integration. The entrypoint.sh exports it as `VITE_GOOGLE_CLIENT_ID`.
+
+**Fix:** Updated Terraform to inject `GOOGLE_CLIENT_ID` from the `mobot-agents/staging` Secrets Manager secret into the task definition. The task definition now includes:
+- `GOOGLE_CLIENT_ID` - Pulled from `mobot-agents/staging` secret
+- `JWT_SECRET`, `MOBOT_JWS_SECRET`, `DATABASE_URL` - Also from same secret
+
+If you see "Configuration Error - VITE_GOOGLE_CLIENT_ID is not configured", verify:
+1. `test_tickets_secret_arn` is set in `terraform.tfvars`
+2. The secret contains the `GOOGLE_CLIENT_ID` key
+3. The task definition has been updated via Terraform apply
+
 ### Infrastructure Drift (Fully Resolved 2026-02-02)
 
 The original CloudFormation ALB was deleted outside of IaC, causing UAT proxy failures. This has been fully resolved:
