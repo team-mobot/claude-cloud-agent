@@ -23,6 +23,19 @@ docs/
   TEST-TICKETS-UAT.md     # Full UAT documentation
 ```
 
+## GitHub App Configuration
+
+The webhook is triggered by a GitHub App. The webhook URL must point to the API Gateway endpoint:
+
+| Setting | Value |
+|---------|-------|
+| Webhook URL | `https://emolxuoaf7.execute-api.us-east-1.amazonaws.com/webhook` |
+| Content type | `application/json` |
+| Secret | Stored in `claude-dev/github-app` Secrets Manager |
+| Events | Issues (labeled), Pull requests (labeled) |
+
+**To update:** GitHub → Settings → Developer settings → GitHub Apps → claude-dev → Webhook
+
 ## Key Workflows
 
 ### 1. GitHub Issue → Claude Agent
