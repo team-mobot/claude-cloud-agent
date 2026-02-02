@@ -104,6 +104,28 @@ aws lambda update-function-code \
 
 **Important:** To change Lambda environment variables or configuration, update Terraform in `lambda.tf`, not the AWS console.
 
+### claude-agent Container
+
+The agent container runs Claude Code to process GitHub issues/PRs.
+
+```bash
+cd agent
+
+# 1. Build the image for linux/amd64 (required for ECS Fargate)
+docker build --platform linux/amd64 -t claude-agent .
+
+# 2. Tag and push to ECR
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 678954237808.dkr.ecr.us-east-1.amazonaws.com
+docker tag claude-agent:latest 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest
+docker push 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest
+```
+
+**Image details:**
+- **ECR:** `678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent`
+- **Platform:** linux/amd64 (required - ECS Fargate doesn't support ARM)
+- **Base:** Python 3.11
+- **Ports:** 3000 (dev server), 8080 (prompt API)
+
 ### test-tickets-uat Container
 
 Always use the staging workflow:
@@ -136,6 +158,7 @@ See `test-tickets-uat/DEPLOY.md` for details.
 | Webhook Domain | `webhook.uat.teammobot.dev` |
 | ECR (agent) | `claude-agent` |
 | ECR (UAT proxy) | `claude-cloud-agent-uat-proxy` |
+| ECR (test-tickets-uat) | `test-tickets-uat` |
 
 ## Environment Variables (Lambda)
 
