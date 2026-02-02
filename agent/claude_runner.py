@@ -1,7 +1,7 @@
 """
-Claude Code CLI wrapper.
+Claude Code CLI wrapper with streaming support.
 
-Runs Claude Code as a subprocess and captures results.
+Runs Claude Code as a subprocess and streams results to GitHub.
 """
 
 import asyncio
@@ -10,16 +10,17 @@ import logging
 import os
 import re
 import subprocess
-from typing import Any
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class ClaudeRunner:
     """
-    Wrapper for Claude Code CLI.
+    Wrapper for Claude Code CLI with streaming output.
 
-    Runs prompts through the CLI and extracts results.
+    Runs prompts through the CLI and streams tool uses/results
+    via callback functions.
     """
 
     def __init__(self, workspace: str):
@@ -32,12 +33,21 @@ class ClaudeRunner:
         self.workspace = workspace
         self.conversation_id = None
 
-    async def run_prompt(self, prompt: str) -> dict[str, Any]:
+    async def run_prompt(
+        self,
+        prompt: str,
+        on_tool_use: Optional[Callable[[str, dict], Any]] = None,
+        on_tool_result: Optional[Callable[[str, bool], Any]] = None,
+        on_text: Optional[Callable[[str], Any]] = None,
+    ) -> dict[str, Any]:
         """
-        Run a prompt through Claude Code.
+        Run a prompt through Claude Code with streaming output.
 
         Args:
             prompt: The prompt to process
+            on_tool_use: Callback for tool uses (tool_name, tool_input)
+            on_tool_result: Callback for tool results (result, is_error)
+            on_text: Callback for Claude's text responses
 
         Returns:
             Result dict with:
@@ -48,48 +58,48 @@ class ClaudeRunner:
         """
         logger.info(f"Running Claude Code with prompt: {prompt[:100]}...")
 
-        # Build command
-        cmd = ["claude", "--dangerously-skip-permissions"]
+        # Build command with streaming JSON output
+        cmd = [
+            "claude",
+            "--dangerously-skip-permissions",
+            "--output-format", "stream-json",
+            "--verbose",
+        ]
 
         # Continue conversation if we have one
         if self.conversation_id:
             cmd.extend(["--continue", self.conversation_id])
 
         # Add the prompt
-        cmd.extend(["--print", prompt])
+        cmd.extend(["-p", prompt])
 
         try:
-            # Run Claude Code
-            result = await asyncio.to_thread(
-                self._run_subprocess,
-                cmd
+            # Run Claude Code with streaming
+            result = await self._run_streaming(
+                cmd,
+                on_tool_use=on_tool_use,
+                on_tool_result=on_tool_result,
+                on_text=on_text,
             )
 
             if result["returncode"] != 0:
-                logger.error(f"Claude Code failed: {result['stderr']}")
+                logger.error(f"Claude Code failed with code {result['returncode']}")
                 return {
                     "success": False,
-                    "error": result["stderr"] or "Claude Code exited with error"
+                    "error": result.get("stderr") or "Claude Code exited with error"
                 }
-
-            # Parse output
-            output = result["stdout"]
-            logger.info(f"Claude Code output: {output[:500]}...")
-
-            # Extract conversation ID for continuation
-            self._extract_conversation_id(output)
 
             # Check for commits
             commits = await self._get_recent_commits()
 
-            # Generate summary
-            summary = self._extract_summary(output)
+            # Push changes if any commits were made
+            if commits:
+                await self.push_changes()
 
             return {
                 "success": True,
-                "summary": summary,
+                "summary": result.get("summary", "Task completed"),
                 "commits": commits,
-                "raw_output": output
             }
 
         except Exception as e:
@@ -99,83 +109,173 @@ class ClaudeRunner:
                 "error": str(e)
             }
 
-    def _run_subprocess(self, cmd: list[str]) -> dict:
+    async def _run_streaming(
+        self,
+        cmd: list[str],
+        on_tool_use: Optional[Callable] = None,
+        on_tool_result: Optional[Callable] = None,
+        on_text: Optional[Callable] = None,
+    ) -> dict:
         """
-        Run a subprocess synchronously.
+        Run command with streaming output parsing.
 
-        Args:
-            cmd: Command and arguments
-
-        Returns:
-            Dict with stdout, stderr, returncode
+        Parses JSON stream and calls callbacks for each event.
         """
         logger.info(f"Running: {' '.join(cmd)}")
 
         env = os.environ.copy()
         env["CLAUDE_CODE_USE_BEDROCK"] = "1"
 
-        result = subprocess.run(
-            cmd,
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             cwd=self.workspace,
-            capture_output=True,
-            text=True,
             env=env,
-            timeout=600  # 10 minute timeout
         )
 
+        summary_parts = []
+        pending_tool_uses = {}  # Track tool_use_id -> (name, input)
+
+        try:
+            # Read stdout line by line
+            while True:
+                line = await asyncio.wait_for(
+                    process.stdout.readline(),
+                    timeout=600  # 10 minute timeout
+                )
+
+                if not line:
+                    break
+
+                line_str = line.decode("utf-8").strip()
+                if not line_str:
+                    continue
+
+                # Try to parse as JSON
+                try:
+                    data = json.loads(line_str)
+                    await self._handle_stream_event(
+                        data,
+                        pending_tool_uses,
+                        summary_parts,
+                        on_tool_use,
+                        on_tool_result,
+                        on_text,
+                    )
+                except json.JSONDecodeError:
+                    # Not JSON, log it
+                    logger.debug(f"Non-JSON output: {line_str[:200]}")
+
+        except asyncio.TimeoutError:
+            logger.error("Claude Code timed out")
+            process.kill()
+            return {"returncode": -1, "stderr": "Timeout"}
+
+        # Wait for process to complete
+        await process.wait()
+
+        # Read any remaining stderr
+        stderr = await process.stderr.read()
+
         return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode
+            "returncode": process.returncode,
+            "stderr": stderr.decode("utf-8") if stderr else "",
+            "summary": " ".join(summary_parts) if summary_parts else "Task completed",
         }
 
-    def _extract_conversation_id(self, output: str) -> None:
-        """Extract and store conversation ID from output."""
-        # Claude Code outputs conversation ID in various formats
-        # Look for patterns like "conversation: abc123" or similar
-        patterns = [
-            r'conversation[:\s]+([a-f0-9-]+)',
-            r'session[:\s]+([a-f0-9-]+)',
-        ]
+    async def _handle_stream_event(
+        self,
+        data: dict,
+        pending_tool_uses: dict,
+        summary_parts: list,
+        on_tool_use: Optional[Callable],
+        on_tool_result: Optional[Callable],
+        on_text: Optional[Callable],
+    ) -> None:
+        """Handle a single stream event."""
+        msg_type = data.get("type")
 
-        for pattern in patterns:
-            match = re.search(pattern, output, re.IGNORECASE)
-            if match:
-                self.conversation_id = match.group(1)
-                logger.info(f"Captured conversation ID: {self.conversation_id}")
-                break
+        if msg_type == "assistant":
+            message = data.get("message", {})
+            content = message.get("content", [])
 
-    def _extract_summary(self, output: str) -> str:
-        """
-        Extract a brief summary from Claude's output.
+            for item in content:
+                item_type = item.get("type")
 
-        Args:
-            output: Raw Claude Code output
+                if item_type == "text":
+                    text = item.get("text", "").strip()
+                    if text:
+                        # Collect for summary
+                        if len(summary_parts) < 3:
+                            summary_parts.append(text[:200])
 
-        Returns:
-            Brief summary string
-        """
-        # Take the first meaningful paragraph
-        lines = output.strip().split("\n")
-        summary_lines = []
+                        # Callback
+                        if on_text:
+                            try:
+                                result = on_text(text)
+                                if asyncio.iscoroutine(result):
+                                    await result
+                            except Exception as e:
+                                logger.warning(f"on_text callback error: {e}")
 
-        for line in lines:
-            line = line.strip()
-            if not line:
-                if summary_lines:
-                    break
-                continue
-            # Skip tool output markers
-            if line.startswith("```") or line.startswith("---"):
-                continue
-            summary_lines.append(line)
-            if len(summary_lines) >= 3:
-                break
+                elif item_type == "tool_use":
+                    tool_name = item.get("name", "unknown")
+                    tool_input = item.get("input", {})
+                    tool_id = item.get("id", "")
 
-        if summary_lines:
-            return " ".join(summary_lines)[:500]
+                    # Track for matching with result
+                    pending_tool_uses[tool_id] = (tool_name, tool_input)
 
-        return "Task completed"
+                    logger.info(f"Tool use: {tool_name}")
+
+                    # Callback
+                    if on_tool_use:
+                        try:
+                            result = on_tool_use(tool_name, tool_input)
+                            if asyncio.iscoroutine(result):
+                                await result
+                        except Exception as e:
+                            logger.warning(f"on_tool_use callback error: {e}")
+
+        elif msg_type == "user":
+            # Tool results come in user messages
+            message = data.get("message", {})
+            content = message.get("content", [])
+
+            for item in content:
+                if item.get("type") == "tool_result":
+                    tool_id = item.get("tool_use_id", "")
+                    result_content = item.get("content", "")
+                    is_error = item.get("is_error", False)
+
+                    # Extract result text
+                    if isinstance(result_content, list):
+                        # Handle structured content
+                        result_text = ""
+                        for part in result_content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                result_text += part.get("text", "")
+                    else:
+                        result_text = str(result_content)
+
+                    logger.info(f"Tool result: {'error' if is_error else 'success'}")
+
+                    # Callback
+                    if on_tool_result:
+                        try:
+                            result = on_tool_result(result_text, is_error)
+                            if asyncio.iscoroutine(result):
+                                await result
+                        except Exception as e:
+                            logger.warning(f"on_tool_result callback error: {e}")
+
+        elif msg_type == "result":
+            # Final result message
+            session_id = data.get("session_id")
+            if session_id:
+                self.conversation_id = session_id
+                logger.info(f"Session ID: {session_id}")
 
     async def _get_recent_commits(self) -> list[str]:
         """

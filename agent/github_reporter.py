@@ -2,17 +2,117 @@
 GitHub reporter for posting PR comments.
 
 Posts progress updates and results to the associated PR.
+Supports streaming updates for tool use and results.
 """
 
+import asyncio
+import json
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import jwt
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+def format_tool_use(tool_name: str, tool_input: dict[str, Any]) -> str:
+    """
+    Format a tool use for display in PR comments.
+
+    Args:
+        tool_name: Name of the tool (Read, Write, Edit, Bash, etc.)
+        tool_input: Tool input parameters
+
+    Returns:
+        Formatted markdown string
+    """
+    if tool_name == "Read":
+        path = tool_input.get("file_path", "unknown")
+        return f"📖 **Reading:** `{path}`"
+
+    elif tool_name == "Write":
+        path = tool_input.get("file_path", "unknown")
+        content = tool_input.get("content", "")
+        preview = content[:300] + "..." if len(content) > 300 else content
+        return f"✏️ **Writing:** `{path}`\n```\n{preview}\n```"
+
+    elif tool_name == "Edit":
+        path = tool_input.get("file_path", "unknown")
+        old = tool_input.get("old_string", "")[:150]
+        new = tool_input.get("new_string", "")[:150]
+        return f"✏️ **Editing:** `{path}`\n\n```diff\n- {old}\n+ {new}\n```"
+
+    elif tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        desc = tool_input.get("description", "")
+        if desc:
+            return f"💻 **Running:** `{cmd}`\n_{desc}_"
+        return f"💻 **Running:** `{cmd}`"
+
+    elif tool_name == "Glob":
+        pattern = tool_input.get("pattern", "")
+        return f"🔍 **Finding files:** `{pattern}`"
+
+    elif tool_name == "Grep":
+        pattern = tool_input.get("pattern", "")
+        return f"🔎 **Searching:** `{pattern}`"
+
+    elif tool_name == "Task":
+        desc = tool_input.get("description", "subtask")
+        return f"🤖 **Spawning agent:** {desc}"
+
+    elif tool_name == "AskUserQuestion":
+        questions = tool_input.get("questions", [])
+        if questions:
+            q = questions[0].get("question", "")
+            return f"❓ **Question:** {q}"
+        return "❓ **Asking a question**"
+
+    else:
+        # Generic tool display
+        input_preview = json.dumps(tool_input, indent=2)[:300]
+        return f"🔧 **{tool_name}**\n```json\n{input_preview}\n```"
+
+
+def format_tool_result(result: str, is_error: bool = False) -> str:
+    """
+    Format a tool result for display.
+
+    Args:
+        result: Tool result content
+        is_error: Whether this is an error result
+
+    Returns:
+        Formatted markdown string
+    """
+    # Truncate long results
+    if len(result) > 1000:
+        result = result[:1000] + "\n...(truncated)"
+
+    if is_error:
+        return f"❌ **Error:**\n```\n{result}\n```"
+    else:
+        return f"✅ **Result:**\n```\n{result}\n```"
+
+
+def format_text_response(text: str) -> str:
+    """
+    Format Claude's text response for display.
+
+    Args:
+        text: Claude's text response
+
+    Returns:
+        Formatted markdown string
+    """
+    # Truncate very long responses
+    if len(text) > 2000:
+        text = text[:2000] + "\n...(truncated)"
+
+    return f"💬 **Claude:**\n\n{text}"
 
 
 class GitHubReporter:
@@ -201,3 +301,86 @@ class GitHubReporter:
         except Exception as e:
             logger.exception(f"Failed to get token: {e}")
             return None
+
+
+class StreamingReporter:
+    """
+    Batches and posts streaming updates to GitHub.
+
+    Collects tool uses and results, posting them in batched comments
+    to avoid rate limiting.
+    """
+
+    def __init__(self, github: GitHubReporter, batch_interval: float = 3.0):
+        """
+        Initialize streaming reporter.
+
+        Args:
+            github: GitHubReporter instance for posting
+            batch_interval: Seconds between batched posts
+        """
+        self.github = github
+        self.batch_interval = batch_interval
+        self._pending_items: list[str] = []
+        self._last_post_time: float = 0
+        self._lock = asyncio.Lock()
+        self._post_task: Optional[asyncio.Task] = None
+
+    async def add_tool_use(self, tool_name: str, tool_input: dict[str, Any]) -> None:
+        """Add a tool use to the pending batch."""
+        formatted = format_tool_use(tool_name, tool_input)
+        async with self._lock:
+            self._pending_items.append(formatted)
+        await self._maybe_post()
+
+    async def add_tool_result(self, result: str, is_error: bool = False) -> None:
+        """Add a tool result to the pending batch."""
+        formatted = format_tool_result(result, is_error)
+        async with self._lock:
+            self._pending_items.append(formatted)
+        await self._maybe_post()
+
+    async def add_text(self, text: str) -> None:
+        """Add Claude's text response to the pending batch."""
+        formatted = format_text_response(text)
+        async with self._lock:
+            self._pending_items.append(formatted)
+        await self._maybe_post()
+
+    async def _maybe_post(self) -> None:
+        """Post if enough time has passed since last post."""
+        now = time.time()
+
+        async with self._lock:
+            if not self._pending_items:
+                return
+
+            # Always post if we have many items
+            if len(self._pending_items) >= 5:
+                await self._post_batch()
+                return
+
+            # Post if enough time has passed
+            if now - self._last_post_time >= self.batch_interval:
+                await self._post_batch()
+
+    async def _post_batch(self) -> None:
+        """Post all pending items as a single comment."""
+        if not self._pending_items:
+            return
+
+        # Combine all items
+        body = "<!-- claude-agent-stream -->\n" + "\n\n---\n\n".join(self._pending_items)
+
+        # Clear pending
+        self._pending_items = []
+        self._last_post_time = time.time()
+
+        # Post comment
+        await self.github.post_comment(body)
+
+    async def flush(self) -> None:
+        """Force post any remaining items."""
+        async with self._lock:
+            if self._pending_items:
+                await self._post_batch()

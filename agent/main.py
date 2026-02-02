@@ -23,7 +23,7 @@ import uvicorn
 from api_server import app, prompt_queue
 from claude_runner import ClaudeRunner
 from session_reporter import SessionReporter
-from github_reporter import GitHubReporter
+from github_reporter import GitHubReporter, StreamingReporter
 from dev_server import DevServerManager
 
 # Configure logging
@@ -78,7 +78,7 @@ async def process_prompts(
     """
     Process prompts from the queue.
 
-    Runs Claude Code for each prompt and posts results to GitHub.
+    Runs Claude Code for each prompt and streams results to GitHub.
     """
     global last_activity_time
 
@@ -101,20 +101,31 @@ async def process_prompts(
                 f"<!-- claude-agent -->\n:robot: Processing feedback from @{author}..."
             )
 
-            # Run Claude Code
-            result = await claude.run_prompt(prompt)
+            # Create streaming reporter for this prompt
+            streamer = StreamingReporter(github, batch_interval=3.0)
 
-            # Post result
+            # Run Claude Code with streaming callbacks
+            result = await claude.run_prompt(
+                prompt,
+                on_tool_use=streamer.add_tool_use,
+                on_tool_result=streamer.add_tool_result,
+                on_text=streamer.add_text,
+            )
+
+            # Flush any remaining updates
+            await streamer.flush()
+
+            # Post final result
             if result["success"]:
                 # Check if there were commits
                 if result.get("commits"):
                     commit_info = "\n".join([f"- `{c}`" for c in result["commits"][-3:]])
                     await github.post_comment(
-                        f"<!-- claude-agent -->\n:white_check_mark: **Changes committed**\n\n{commit_info}\n\n{result.get('summary', '')}"
+                        f"<!-- claude-agent -->\n:white_check_mark: **Changes committed**\n\n{commit_info}"
                     )
                 else:
                     await github.post_comment(
-                        f"<!-- claude-agent -->\n:speech_balloon: {result.get('summary', 'Completed')}"
+                        f"<!-- claude-agent -->\n:white_check_mark: **Completed**"
                     )
             else:
                 await github.post_comment(
@@ -212,17 +223,30 @@ async def main():
         logger.info("Processing initial prompt...")
         last_activity_time = time.time()
 
-        result = await claude.run_prompt(INITIAL_PROMPT)
+        # Create streaming reporter for initial prompt
+        streamer = StreamingReporter(github, batch_interval=3.0)
 
+        # Run Claude Code with streaming callbacks
+        result = await claude.run_prompt(
+            INITIAL_PROMPT,
+            on_tool_use=streamer.add_tool_use,
+            on_tool_result=streamer.add_tool_result,
+            on_text=streamer.add_text,
+        )
+
+        # Flush any remaining updates
+        await streamer.flush()
+
+        # Post final result
         if result["success"]:
             if result.get("commits"):
                 commit_info = "\n".join([f"- `{c}`" for c in result["commits"][-3:]])
                 await github.post_comment(
-                    f"<!-- claude-agent -->\n:white_check_mark: **Initial implementation complete**\n\n{commit_info}\n\n{result.get('summary', '')}"
+                    f"<!-- claude-agent -->\n:white_check_mark: **Initial implementation complete**\n\n{commit_info}"
                 )
             else:
                 await github.post_comment(
-                    f"<!-- claude-agent -->\n:memo: {result.get('summary', 'Analysis complete')}"
+                    f"<!-- claude-agent -->\n:white_check_mark: **Analysis complete**"
                 )
         else:
             await github.post_comment(
