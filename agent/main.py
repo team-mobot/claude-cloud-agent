@@ -59,11 +59,11 @@ def get_workspace_path() -> str:
 
 
 async def run_api_server():
-    """Run the FastAPI server."""
+    """Run the FastAPI server on port 3000 (where ALB routes traffic)."""
     config = uvicorn.Config(
         app,
         host="0.0.0.0",
-        port=8080,
+        port=3000,  # ALB routes here; we proxy dev server requests to 3001
         log_level="info"
     )
     server = uvicorn.Server(config)
@@ -210,11 +210,11 @@ async def main():
         f"I'm starting work on this issue. Comment on this PR to provide feedback."
     )
 
-    # Start dev server
+    # Start dev server (on port 3001, proxied through API server on 3000)
     logger.info("Starting dev server...")
     dev_server_started = await dev_server.start()
     if dev_server_started:
-        logger.info("Dev server started on port 3000")
+        logger.info("Dev server started on port 3001 (proxied via API server on 3000)")
     else:
         logger.warning("Could not auto-detect dev server")
 

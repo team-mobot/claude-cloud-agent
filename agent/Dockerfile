@@ -40,9 +40,9 @@ RUN chmod +x /entrypoint.sh && chown claude:claude /entrypoint.sh
 WORKDIR /workspace
 
 # Expose ports
-# 8080: Prompt API
-# 3000: Dev server (target app)
-EXPOSE 8080 3000
+# 3000: API server (handles /prompt, /health, /status and proxies to dev server)
+# Port 3001 is used internally for dev server (not exposed)
+EXPOSE 3000
 
 # Environment variables (overridden at runtime)
 ENV SESSION_ID=""

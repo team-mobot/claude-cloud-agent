@@ -124,7 +124,16 @@ docker push 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest
 - **ECR:** `678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent`
 - **Platform:** linux/amd64 (required - ECS Fargate doesn't support ARM)
 - **Base:** Python 3.11
-- **Ports:** 3000 (dev server), 8080 (prompt API)
+- **Port 3000:** Unified API server (handles /prompt, /health, /status and proxies all other requests to dev server)
+- **Port 3001:** Dev server (internal only, not exposed)
+
+**Port Architecture:**
+The container runs a unified API server on port 3000 that:
+1. Handles `/prompt` endpoint for receiving PR comments via webhook
+2. Handles `/health` and `/status` for ALB health checks
+3. Proxies all other requests to the dev server running on port 3001
+
+This allows PR comment routing via the public ALB URL (`https://{session-id}.uat.teammobot.dev/prompt`) since the Lambda webhook is not in the VPC and cannot reach the container's private IP directly.
 
 ### test-tickets-uat Container
 
@@ -414,6 +423,26 @@ The `test_tickets` app requires `VITE_GOOGLE_CLIENT_ID` for Google OAuth. Two co
 4. New tasks will get the env var; existing tasks need to be restarted
 
 **Verified working:** 2026-02-02, session `8c6b2de8` loaded https://8c6b2de8.uat.teammobot.dev/ without error
+
+### PR Comment Routing (Fixed 2026-02-02)
+
+PR comments now properly flow back to running agent containers via the public ALB URL.
+
+**Previous issue:** Lambda webhook tried to forward comments to the container's private IP (`http://{container_ip}:8080/prompt`), but Lambda is not in VPC and couldn't reach private IPs.
+
+**Solution implemented:**
+1. Unified the API server and dev server onto port 3000
+2. API server handles `/prompt`, `/health`, `/status` directly
+3. API server proxies all other requests to dev server on port 3001 (internal)
+4. Webhook Lambda now uses public ALB URL: `https://{session_id}.uat.teammobot.dev/prompt`
+
+**Files changed:**
+- `agent/api_server.py` - Added reverse proxy for dev server
+- `agent/dev_server.py` - Changed port from 3000 to 3001
+- `agent/main.py` - Changed uvicorn port from 8080 to 3000
+- `webhook/handler.py` - Changed prompt URL to use ALB URL
+
+**Verified working:** 2026-02-02, session `4c9e1c6f` received PR comment from webhook via `https://4c9e1c6f.uat.teammobot.dev/prompt`
 
 ### Infrastructure Drift (Fully Resolved 2026-02-02)
 

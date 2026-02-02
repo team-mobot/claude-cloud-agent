@@ -43,7 +43,8 @@ class DevServerManager:
         """
         self.workspace = Path(workspace)
         self.process: Optional[subprocess.Popen] = None
-        self.port = 3000
+        # Run dev server on 3001 (internal) - API server on 3000 proxies to it
+        self.port = 3001
 
     async def start(self) -> bool:
         """

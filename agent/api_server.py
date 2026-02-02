@@ -5,6 +5,10 @@ Exposes endpoints:
 - POST /prompt: Queue a prompt for processing
 - GET /health: Health check
 - GET /status: Session status
+- /* : Proxy to dev server (for UAT preview)
+
+Runs on port 3000 - ALB routes all traffic here. Non-API requests
+are proxied to the dev server running on port 3001.
 """
 
 import asyncio
@@ -13,12 +17,28 @@ import os
 import time
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Claude Agent API", version="1.0.0")
+
+# Dev server URL for proxying (internal only)
+DEV_SERVER_URL = "http://localhost:3001"
+
+# HTTP client for proxying
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """Get or create async HTTP client for proxying."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0)
+    return _http_client
 
 # Prompt queue (shared with main.py)
 prompt_queue: asyncio.Queue = asyncio.Queue()
@@ -119,11 +139,59 @@ async def get_status():
     )
 
 
-@app.get("/")
-async def root():
-    """Root endpoint."""
-    return {
-        "service": "Claude Cloud Agent",
-        "version": "1.0.0",
-        "session_id": os.environ.get("SESSION_ID", "unknown")
-    }
+@app.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
+)
+async def proxy_to_dev_server(request: Request, path: str):
+    """
+    Proxy all non-API requests to the dev server.
+
+    This allows the ALB to route all traffic to port 3000 (this server),
+    and we forward non-API requests to the dev server on port 3001.
+    """
+    # Don't proxy API paths (they should be handled by explicit routes above)
+    # If we get here for an API path, it means the route wasn't found
+    if path in ("prompt", "health", "status"):
+        raise HTTPException(status_code=404, detail=f"/{path} should use explicit route")
+
+    client = get_http_client()
+
+    # Build target URL
+    target_url = f"{DEV_SERVER_URL}/{path}"
+    if request.query_params:
+        target_url += f"?{request.query_params}"
+
+    try:
+        # Forward the request
+        response = await client.request(
+            method=request.method,
+            url=target_url,
+            headers={
+                k: v for k, v in request.headers.items()
+                if k.lower() not in ("host", "content-length")
+            },
+            content=await request.body() if request.method in ("POST", "PUT", "PATCH") else None,
+        )
+
+        # Return proxied response
+        return StreamingResponse(
+            content=response.iter_bytes(),
+            status_code=response.status_code,
+            headers={
+                k: v for k, v in response.headers.items()
+                if k.lower() not in ("content-encoding", "transfer-encoding", "content-length")
+            },
+            media_type=response.headers.get("content-type")
+        )
+
+    except httpx.ConnectError:
+        # Dev server not running yet
+        return {
+            "error": "Dev server not available",
+            "message": "The development server is starting up. Please wait a moment and refresh.",
+            "session_id": os.environ.get("SESSION_ID", "unknown")
+        }
+    except Exception as e:
+        logger.warning(f"Proxy error for {path}: {e}")
+        raise HTTPException(status_code=502, detail=f"Proxy error: {e}")

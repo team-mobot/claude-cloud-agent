@@ -476,33 +476,27 @@ def handle_issue_comment(
             "body": json.dumps({"message": "Session not running"})
         }
 
-    container_ip = session.get("container_ip")
-    if not container_ip:
-        logger.warning(f"Session {session['session_id']} has no container IP")
+    session_id = session.get("session_id")
+    if not session_id:
+        logger.warning(f"Session missing session_id")
         return {
             "statusCode": 200,
             "body": json.dumps({"message": "Container not ready"})
         }
 
-    # Forward comment to container with GitHub context for posting responses
+    # Forward comment to container's prompt API via public ALB URL
+    # This works because Lambda may not be in VPC but ALB URL is publicly accessible
     import requests
     try:
-        prompt_url = f"http://{container_ip}:8080/prompt"
+        prompt_url = f"https://{session_id}.{UAT_DOMAIN_SUFFIX}/prompt"
         logger.info(f"Forwarding comment to {prompt_url}")
-
-        # Parse owner/repo from full_name
-        owner, repo_name = repo_full_name.split("/", 1)
 
         response = requests.post(
             prompt_url,
             json={
                 "prompt": comment_body,
-                "github": {
-                    "owner": owner,
-                    "repo": repo_name,
-                    "prNumber": pr_number,
-                    "token": github.get_token()
-                }
+                "author": comment_author,
+                "comment_id": comment.get("id")
             },
             timeout=30  # Prompt server should return quickly after accepting
         )
