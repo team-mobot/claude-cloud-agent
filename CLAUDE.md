@@ -48,6 +48,8 @@ When `uat` or `uat-staging` label is added to a PR in `team-mobot/test_tickets`:
 
 ### Lambda (webhook handler)
 
+The Lambda **configuration** (env vars, IAM, timeout, etc.) is managed by Terraform. Only deploy **code changes** manually:
+
 ```bash
 # Copy updated files to deployment directory
 cp webhook/*.py /path/to/version-two/webhook-deploy/
@@ -61,6 +63,8 @@ aws lambda update-function-code \
 ```
 
 The deployment directory must contain dependencies (requests, jwt, cryptography, etc.) - don't create a fresh zip from just the .py files.
+
+**Important:** To change Lambda environment variables or configuration, update Terraform in `lambda.tf`, not the AWS console.
 
 ### test-tickets-uat Container
 
@@ -148,6 +152,8 @@ All of these resources are managed by Terraform. Do not modify manually:
 
 | Resource Type | Name |
 |---------------|------|
+| Lambda Function | `claude-cloud-agent-webhook` |
+| API Gateway HTTP API | `claude-cloud-agent-webhook` (ID: `emolxuoaf7`) |
 | ECS Cluster | `claude-cloud-agent` |
 | ECS Service | `claude-cloud-agent-uat-proxy` |
 | ECS Task Definitions | `claude-cloud-agent`, `claude-cloud-agent-uat-proxy` |
@@ -155,8 +161,10 @@ All of these resources are managed by Terraform. Do not modify manually:
 | Target Group | `claude-cloud-agent-uat-proxy` |
 | Listener Rule | Priority 10 on `test-tickets-uat-alb` |
 | Security Groups | `claude-cloud-agent-uat-proxy`, `claude-cloud-agent-agent` |
-| IAM Roles | `claude-cloud-agent-AgentExecutionRole`, `claude-cloud-agent-AgentTaskRole`, `claude-cloud-agent-ProxyExecutionRole`, `claude-cloud-agent-UatProxyTaskRole` |
-| CloudWatch Log Groups | `/ecs/claude-cloud-agent`, `/ecs/claude-cloud-agent-uat-proxy` |
+| IAM Roles | `claude-cloud-agent-AgentExecutionRole`, `claude-cloud-agent-AgentTaskRole`, `claude-cloud-agent-ProxyExecutionRole`, `claude-cloud-agent-UatProxyTaskRole`, `claude-cloud-agent-WebhookLambdaRole` |
+| CloudWatch Log Groups | `/ecs/claude-cloud-agent`, `/ecs/claude-cloud-agent-uat-proxy`, `/aws/lambda/claude-cloud-agent-webhook` |
+
+**Webhook API Endpoint:** `https://emolxuoaf7.execute-api.us-east-1.amazonaws.com`
 
 ### Workspace Environment Variables
 
