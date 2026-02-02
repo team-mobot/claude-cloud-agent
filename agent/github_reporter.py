@@ -305,82 +305,129 @@ class GitHubReporter:
 
 class StreamingReporter:
     """
-    Batches and posts streaming updates to GitHub.
+    Posts streaming updates to GitHub with logical grouping.
 
-    Collects tool uses and results, posting them in batched comments
-    to avoid rate limiting.
+    Groups related items:
+    - Claude's text responses → posted immediately as separate comments
+    - Tool use + result → grouped together
+    - Consecutive similar tools (reads) → batched together
     """
 
-    def __init__(self, github: GitHubReporter, batch_interval: float = 3.0):
+    # Tools that can be batched together
+    BATCH_TOOLS = {"Read", "Glob", "Grep"}
+
+    # Minimum time between posts to avoid rate limiting
+    MIN_POST_INTERVAL = 1.0
+
+    def __init__(self, github: GitHubReporter):
         """
         Initialize streaming reporter.
 
         Args:
             github: GitHubReporter instance for posting
-            batch_interval: Seconds between batched posts
         """
         self.github = github
-        self.batch_interval = batch_interval
-        self._pending_items: list[str] = []
+        self._pending_tool_use: Optional[tuple[str, str]] = None  # (tool_name, formatted)
+        self._batch_buffer: list[str] = []  # For batching similar tools
+        self._batch_tool_type: Optional[str] = None
         self._last_post_time: float = 0
         self._lock = asyncio.Lock()
-        self._post_task: Optional[asyncio.Task] = None
 
-    async def add_tool_use(self, tool_name: str, tool_input: dict[str, Any]) -> None:
-        """Add a tool use to the pending batch."""
-        formatted = format_tool_use(tool_name, tool_input)
-        async with self._lock:
-            self._pending_items.append(formatted)
-        await self._maybe_post()
+    async def _rate_limit_wait(self) -> None:
+        """Wait if needed to avoid rate limiting."""
+        elapsed = time.time() - self._last_post_time
+        if elapsed < self.MIN_POST_INTERVAL:
+            await asyncio.sleep(self.MIN_POST_INTERVAL - elapsed)
 
-    async def add_tool_result(self, result: str, is_error: bool = False) -> None:
-        """Add a tool result to the pending batch."""
-        formatted = format_tool_result(result, is_error)
-        async with self._lock:
-            self._pending_items.append(formatted)
-        await self._maybe_post()
-
-    async def add_text(self, text: str) -> None:
-        """Add Claude's text response to the pending batch."""
-        formatted = format_text_response(text)
-        async with self._lock:
-            self._pending_items.append(formatted)
-        await self._maybe_post()
-
-    async def _maybe_post(self) -> None:
-        """Post if enough time has passed since last post."""
-        now = time.time()
-
-        async with self._lock:
-            if not self._pending_items:
-                return
-
-            # Always post if we have many items
-            if len(self._pending_items) >= 5:
-                await self._post_batch()
-                return
-
-            # Post if enough time has passed
-            if now - self._last_post_time >= self.batch_interval:
-                await self._post_batch()
-
-    async def _post_batch(self) -> None:
-        """Post all pending items as a single comment."""
-        if not self._pending_items:
-            return
-
-        # Combine all items
-        body = "<!-- claude-agent-stream -->\n" + "\n\n---\n\n".join(self._pending_items)
-
-        # Clear pending
-        self._pending_items = []
+    async def _post(self, body: str) -> None:
+        """Post a comment with rate limiting."""
+        await self._rate_limit_wait()
+        await self.github.post_comment(f"<!-- claude-agent-stream -->\n{body}")
         self._last_post_time = time.time()
 
-        # Post comment
-        await self.github.post_comment(body)
+    async def add_text(self, text: str) -> None:
+        """Post Claude's text response immediately as its own comment."""
+        async with self._lock:
+            # Flush any pending items first
+            await self._flush_pending()
+
+            # Post text immediately
+            formatted = format_text_response(text)
+            await self._post(formatted)
+
+    async def add_tool_use(self, tool_name: str, tool_input: dict[str, Any]) -> None:
+        """
+        Add a tool use.
+
+        Batchable tools (Read, Glob, Grep) are collected.
+        Other tools flush the batch and wait for their result.
+        """
+        formatted = format_tool_use(tool_name, tool_input)
+
+        async with self._lock:
+            if tool_name in self.BATCH_TOOLS:
+                # If switching tool types, flush first
+                if self._batch_tool_type and self._batch_tool_type != tool_name:
+                    await self._flush_batch()
+
+                self._batch_tool_type = tool_name
+                self._batch_buffer.append(formatted)
+
+                # Post batch if it gets large
+                if len(self._batch_buffer) >= 4:
+                    await self._flush_batch()
+            else:
+                # Non-batchable tool - flush batch and store for pairing with result
+                await self._flush_batch()
+                self._pending_tool_use = (tool_name, formatted)
+
+    async def add_tool_result(self, result: str, is_error: bool = False) -> None:
+        """
+        Add a tool result.
+
+        If there's a pending tool use, pair them together.
+        Otherwise post the result alone.
+        """
+        formatted = format_tool_result(result, is_error)
+
+        async with self._lock:
+            if self._pending_tool_use:
+                # Pair with pending tool use
+                tool_name, tool_formatted = self._pending_tool_use
+                self._pending_tool_use = None
+
+                body = f"{tool_formatted}\n\n{formatted}"
+                await self._post(body)
+            elif self._batch_buffer:
+                # Result for batched tools - add to batch and flush
+                self._batch_buffer.append(formatted)
+                await self._flush_batch()
+            else:
+                # Orphaned result - post alone
+                await self._post(formatted)
+
+    async def _flush_batch(self) -> None:
+        """Flush the batch buffer."""
+        if not self._batch_buffer:
+            return
+
+        body = "\n\n---\n\n".join(self._batch_buffer)
+        self._batch_buffer = []
+        self._batch_tool_type = None
+        await self._post(body)
+
+    async def _flush_pending(self) -> None:
+        """Flush any pending items."""
+        # Flush batch first
+        await self._flush_batch()
+
+        # Flush unpaired tool use (shouldn't happen often)
+        if self._pending_tool_use:
+            _, formatted = self._pending_tool_use
+            self._pending_tool_use = None
+            await self._post(formatted)
 
     async def flush(self) -> None:
         """Force post any remaining items."""
         async with self._lock:
-            if self._pending_items:
-                await self._post_batch()
+            await self._flush_pending()

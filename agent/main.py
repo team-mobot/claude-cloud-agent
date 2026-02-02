@@ -102,7 +102,7 @@ async def process_prompts(
             )
 
             # Create streaming reporter for this prompt
-            streamer = StreamingReporter(github, batch_interval=3.0)
+            streamer = StreamingReporter(github)
 
             # Run Claude Code with streaming callbacks
             result = await claude.run_prompt(
@@ -224,7 +224,7 @@ async def main():
         last_activity_time = time.time()
 
         # Create streaming reporter for initial prompt
-        streamer = StreamingReporter(github, batch_interval=3.0)
+        streamer = StreamingReporter(github)
 
         # Run Claude Code with streaming callbacks
         result = await claude.run_prompt(
