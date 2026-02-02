@@ -362,16 +362,29 @@ The Lambda requires Linux binaries for cryptography. The deployment directory at
 
 ### VITE_GOOGLE_CLIENT_ID Configuration (Fixed 2026-02-02)
 
-The `test-tickets-uat` container requires `GOOGLE_CLIENT_ID` for Vite's Google OAuth integration. The entrypoint.sh exports it as `VITE_GOOGLE_CLIENT_ID`.
+The `test_tickets` app requires `VITE_GOOGLE_CLIENT_ID` for Google OAuth. Two containers may run this app:
 
-**Fix:** Updated Terraform to inject `GOOGLE_CLIENT_ID` from the `mobot-agents/staging` Secrets Manager secret into the task definition. The task definition now includes:
-- `GOOGLE_CLIENT_ID` - Pulled from `mobot-agents/staging` secret
-- `JWT_SECRET`, `MOBOT_JWS_SECRET`, `DATABASE_URL` - Also from same secret
+1. **claude-agent** - Generic agent triggered by `claude-dev` label on issues
+2. **test-tickets-uat** - Specific UAT container triggered by `uat` label on PRs
 
-If you see "Configuration Error - VITE_GOOGLE_CLIENT_ID is not configured", verify:
-1. `test_tickets_secret_arn` is set in `terraform.tfvars`
-2. The secret contains the `GOOGLE_CLIENT_ID` key
-3. The task definition has been updated via Terraform apply
+**How it works:**
+- Both task definitions inject `VITE_GOOGLE_CLIENT_ID` from `mobot-agents/staging` Secrets Manager secret
+- The `claude-agent` gets it directly as `VITE_GOOGLE_CLIENT_ID` env var (inherited by npm process)
+- The `test-tickets-uat` gets `GOOGLE_CLIENT_ID` and exports it as `VITE_GOOGLE_CLIENT_ID` in entrypoint.sh
+
+**Terraform changes made:**
+- `terraform.tfvars`: Set `test_tickets_secret_arn` to `mobot-agents/staging` secret ARN
+- `ecs.tf`: Added `VITE_GOOGLE_CLIENT_ID` secret to `claude-agent` task definition
+- `ecs.tf`: Added `GOOGLE_CLIENT_ID` secret to `test-tickets-uat` task definition
+- `iam.tf`: Added `mobot-agents/staging` secret access to agent execution role
+
+**If you see "Configuration Error - VITE_GOOGLE_CLIENT_ID is not configured":**
+1. Verify `test_tickets_secret_arn` is set in `terraform.tfvars`
+2. Verify the secret contains the `GOOGLE_CLIENT_ID` key
+3. Run `terraform apply` to update task definitions
+4. New tasks will get the env var; existing tasks need to be restarted
+
+**Verified working:** 2026-02-02, session `8c6b2de8` loaded https://8c6b2de8.uat.teammobot.dev/ without error
 
 ### Infrastructure Drift (Fully Resolved 2026-02-02)
 
