@@ -193,6 +193,7 @@ To update credentials: Go to workspace → Variables → Edit
 2. Uses existing `test-tickets-uat-alb` (DNS `*.uat.teammobot.dev` points there)
 3. Proxy env var must be `SESSIONS_TABLE` (not `SESSION_TABLE`)
 4. Security group must allow traffic from ALB SG `sg-01e33c097eb569074`
+5. Agent task definition container must be named `claude-agent` (Lambda code expects this name for overrides)
 
 ### Terraform Deployment Workflow
 
