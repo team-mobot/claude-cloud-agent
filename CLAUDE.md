@@ -36,7 +36,7 @@ The webhook is triggered by a GitHub App. Use the **custom domain URL** (stable 
 
 **To update:** GitHub → Settings → Developer settings → GitHub Apps → claude-dev → Webhook
 
-> **Note:** The raw API Gateway URL (`https://emolxuoaf7.execute-api.us-east-1.amazonaws.com/webhook`) also works but changes if infrastructure is destroyed/recreated. Always use the custom domain.
+> **Note:** The raw API Gateway URL changes when infrastructure is destroyed/recreated. Always use the custom domain `webhook.uat.teammobot.dev`.
 
 ## Key Workflows
 
@@ -63,21 +63,34 @@ When `uat` or `uat-staging` label is added to a PR in `team-mobot/test_tickets`:
 
 ### Lambda (webhook handler)
 
-The Lambda **configuration** (env vars, IAM, timeout, etc.) is managed by Terraform. Only deploy **code changes** manually:
+The Lambda **configuration** (env vars, IAM, timeout, etc.) is managed by Terraform. Only deploy **code changes** manually.
+
+**Deployment directory:** `/Users/dave/git/claude-cloud-agent/version-two/webhook-deploy/`
+
+This directory contains pre-built Linux dependencies (requests, jwt, cryptography, etc.). Never rebuild from scratch on macOS.
 
 ```bash
-# Copy updated files to deployment directory
-cp webhook/*.py /path/to/version-two/webhook-deploy/
+# 1. Copy updated Python files to deployment directory
+cp /Users/dave/git/claude-cloud-agent/main/webhook/*.py \
+   /Users/dave/git/claude-cloud-agent/version-two/webhook-deploy/
 
-# Create zip and deploy
-cd /path/to/version-two/webhook-deploy
-zip -r ../webhook-lambda.zip .
+# 2. Create deployment zip
+cd /Users/dave/git/claude-cloud-agent/version-two/webhook-deploy
+zip -r ../webhook-lambda-new.zip . -x "*.pyc" -x "__pycache__/*" -x "*.DS_Store"
+
+# 3. Deploy webhook Lambda
+cd /Users/dave/git/claude-cloud-agent/version-two
 aws lambda update-function-code \
   --function-name claude-cloud-agent-webhook \
-  --zip-file fileb://../webhook-lambda.zip
-```
+  --zip-file fileb://webhook-lambda-new.zip \
+  --region us-east-1
 
-The deployment directory must contain dependencies (requests, jwt, cryptography, etc.) - don't create a fresh zip from just the .py files.
+# 4. Deploy idle-timeout Lambda (uses same zip - contains idle_timeout.py)
+aws lambda update-function-code \
+  --function-name claude-cloud-agent-idle-timeout \
+  --zip-file fileb://webhook-lambda-new.zip \
+  --region us-east-1
+```
 
 **Important:** To change Lambda environment variables or configuration, update Terraform in `lambda.tf`, not the AWS console.
 
@@ -182,7 +195,7 @@ All of these resources are managed by Terraform. Do not modify manually:
 | Resource Type | Name |
 |---------------|------|
 | Lambda Functions | `claude-cloud-agent-webhook`, `claude-cloud-agent-idle-timeout` |
-| API Gateway HTTP API | `claude-cloud-agent-webhook` (ID: `emolxuoaf7`) |
+| API Gateway HTTP API | `claude-cloud-agent-webhook` (ID changes on recreate) |
 | EventBridge Rule | `claude-agent-idle-timeout-schedule` (runs every 10 min) |
 | ECS Cluster | `claude-cloud-agent` |
 | ECS Service | `claude-cloud-agent-uat-proxy` |
@@ -258,22 +271,58 @@ See `docs/INFRASTRUCTURE-AUDIT-2026-02-02.md` for full audit details.
 
 To fully test that Terraform can recreate infrastructure from scratch:
 
+**Option 1: Using Terraform Cloud MCP (recommended)**
+
 ```bash
-# 1. Destroy all infrastructure
-cd /Users/dave/git/mobot/terraform-cloud
-# Create a destroy run via Terraform Cloud UI or API
+# Claude Code can use MCP tools directly:
 
-# 2. Apply to recreate
-# Push any commit to trigger, or create run via UI
+# 1. Create destroy run
+mcp__terraform-cloud__create_run
+  workspace_id: ws-3zmsw77ih3j4YVoT
+  params: {"is-destroy": true, "message": "Full infrastructure destroy for testing"}
 
-# 3. Redeploy Lambda code (Terraform only creates placeholder)
-cd /path/to/webhook-deploy
-zip -r ../webhook-lambda.zip .
-aws lambda update-function-code \
-  --function-name claude-cloud-agent-webhook \
-  --zip-file fileb://../webhook-lambda.zip
+# 2. Confirm/apply the destroy (after plan completes)
+mcp__terraform-cloud__apply_run
+  run_id: <run-id from step 1>
 
-# Same for idle-timeout Lambda if needed
+# 3. Create apply run to recreate
+mcp__terraform-cloud__create_run
+  workspace_id: ws-3zmsw77ih3j4YVoT
+  params: {"message": "Recreate all infrastructure"}
+
+# 4. Confirm/apply the recreate
+mcp__terraform-cloud__apply_run
+  run_id: <run-id from step 3>
+
+# 5. Redeploy Lambda code (see "Deploying Changes" section above)
+```
+
+**Option 2: Using Terraform Cloud UI**
+
+1. Go to https://app.terraform.io/app/mobot/workspaces/aws-projects__claude-cloud-agent
+2. Actions → Start new run → Destroy all resources
+3. Review plan and confirm
+4. After destroy completes, create another run to apply
+5. Redeploy Lambda code (see "Deploying Changes" section above)
+
+**Post-recreate verification:**
+
+```bash
+# Test webhook endpoint
+curl -s -X POST https://webhook.uat.teammobot.dev/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-GitHub-Event: ping" \
+  -d '{"zen": "test"}'
+# Should return: {"error": "Invalid signature"} (expected - no valid signature)
+
+# Test end-to-end by creating issue with claude-dev label
+gh issue create --repo team-mobot/test_tickets \
+  --title "Test: Infrastructure validation" \
+  --body "Testing webhook after infrastructure recreate" \
+  --label "claude-dev"
+
+# Check Lambda logs
+aws logs tail /aws/lambda/claude-cloud-agent-webhook --since 5m --region us-east-1
 ```
 
 **What survives destroy/recreate:**
@@ -284,9 +333,12 @@ aws lambda update-function-code \
 | ACM Certificate | ✅ Yes | `*.uat.teammobot.dev` not managed by this Terraform |
 | ECR Images | ✅ Yes | Container images stored separately |
 | Secrets Manager | ✅ Yes | `claude-dev/github-app` not managed here |
+| GitHub App config | ✅ Yes | Webhook URL doesn't change |
 | Lambda code | ❌ No | Must redeploy after recreate (Terraform creates placeholder) |
 | DynamoDB data | ❌ No | Sessions table is recreated empty |
 | CloudWatch logs | ❌ No | Log groups recreated (old logs deleted) |
+
+**Last tested:** 2026-02-02 (destroy run-CYtYfcvREsCJbUCk, recreate run-ve3XzHbQmJhrUXai)
 
 ### Idle Timeout Lambda
 
@@ -304,9 +356,9 @@ The `claude-cloud-agent-idle-timeout` Lambda runs every 10 minutes to stop ECS t
 
 The `claude-agent` ECS container uses Python modules (`session_reporter.py`, `github_reporter.py`, `claude_runner.py`) but the source location is unknown. The `/Users/dave/git/cca/agent/` directory has a bash-based entrypoint that doesn't match the deployed container.
 
-### Lambda Deployment
+### Lambda Deployment Notes
 
-The Lambda requires Linux binaries for cryptography. Don't rebuild the zip on macOS - update the existing deployment directory that has pre-built Linux dependencies.
+The Lambda requires Linux binaries for cryptography. The deployment directory at `/Users/dave/git/claude-cloud-agent/version-two/webhook-deploy/` contains pre-built Linux dependencies. Never rebuild from scratch on macOS - always copy Python files to this directory and create the zip from there.
 
 ### Infrastructure Drift (Fully Resolved 2026-02-02)
 
@@ -315,5 +367,6 @@ The original CloudFormation ALB was deleted outside of IaC, causing UAT proxy fa
 2. Tore down all manually-created resources
 3. Terraform now manages everything from scratch
 4. Uses existing `test-tickets-uat-alb` (shared with test-tickets project)
+5. Full destroy/recreate test passed 2026-02-02
 
 All infrastructure is now fully managed by Terraform Cloud workspace `aws-projects__claude-cloud-agent`.
