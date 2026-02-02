@@ -103,17 +103,20 @@ See `test-tickets-uat/DEPLOY.md` for details.
 
 | Resource | Name/ARN |
 |----------|----------|
-| Lambda | `claude-cloud-agent-webhook` |
+| Lambda (webhook) | `claude-cloud-agent-webhook` |
+| Lambda (idle cleanup) | `claude-cloud-agent-idle-timeout` |
 | ECS Cluster | `claude-cloud-agent` |
 | Agent Task Def | `claude-agent` |
-| UAT Task Def | `test-tickets-uat` |
+| UAT Proxy Task Def | `claude-cloud-agent-uat-proxy` |
 | Sessions Table | `claude-cloud-agent-sessions` |
 | GitHub Secret | `claude-dev/github-app` |
-| UAT Secret | `test-tickets/uat/agnts-0` |
+| Webhook Domain | `webhook.uat.teammobot.dev` |
 | ECR (agent) | `claude-agent` |
-| ECR (UAT) | `test-tickets-uat` |
+| ECR (UAT proxy) | `claude-cloud-agent-uat-proxy` |
 
 ## Environment Variables (Lambda)
+
+### Webhook Lambda (`claude-cloud-agent-webhook`)
 
 | Variable | Purpose |
 |----------|---------|
@@ -122,8 +125,19 @@ See `test-tickets-uat/DEPLOY.md` for details.
 | `TEST_TICKETS_TASK_DEFINITION` | Task def for test-tickets-uat |
 | `SESSIONS_TABLE` | DynamoDB table |
 | `GITHUB_APP_SECRET_ARN` | GitHub App credentials |
+| `JIRA_SECRET_ARN` | JIRA API credentials (optional) |
 | `ALB_LISTENER_ARN` | For UAT routing rules |
 | `UAT_DOMAIN_SUFFIX` | `uat.teammobot.dev` |
+| `JIRA_TRIGGER_KEYWORD` | `@claude` |
+| `JIRA_TRIGGER_LABEL` | `claude-dev` |
+
+### Idle Timeout Lambda (`claude-cloud-agent-idle-timeout`)
+
+| Variable | Purpose |
+|----------|---------|
+| `SESSIONS_TABLE` | DynamoDB table to scan for idle sessions |
+| `ALB_LISTENER_ARN` | For cleaning up routing rules |
+| `IDLE_TIMEOUT_MINUTES` | Minutes before session is considered idle (default: 60) |
 
 ## Cleaning Up Test Resources
 
@@ -239,6 +253,48 @@ claude mcp list
 ```
 
 See `docs/INFRASTRUCTURE-AUDIT-2026-02-02.md` for full audit details.
+
+### Testing Infrastructure (Destroy/Recreate)
+
+To fully test that Terraform can recreate infrastructure from scratch:
+
+```bash
+# 1. Destroy all infrastructure
+cd /Users/dave/git/mobot/terraform-cloud
+# Create a destroy run via Terraform Cloud UI or API
+
+# 2. Apply to recreate
+# Push any commit to trigger, or create run via UI
+
+# 3. Redeploy Lambda code (Terraform only creates placeholder)
+cd /path/to/webhook-deploy
+zip -r ../webhook-lambda.zip .
+aws lambda update-function-code \
+  --function-name claude-cloud-agent-webhook \
+  --zip-file fileb://../webhook-lambda.zip
+
+# Same for idle-timeout Lambda if needed
+```
+
+**What survives destroy/recreate:**
+
+| Resource | Survives? | Notes |
+|----------|-----------|-------|
+| Webhook URL | ✅ Yes | Custom domain `webhook.uat.teammobot.dev` persists |
+| ACM Certificate | ✅ Yes | `*.uat.teammobot.dev` not managed by this Terraform |
+| ECR Images | ✅ Yes | Container images stored separately |
+| Secrets Manager | ✅ Yes | `claude-dev/github-app` not managed here |
+| Lambda code | ❌ No | Must redeploy after recreate (Terraform creates placeholder) |
+| DynamoDB data | ❌ No | Sessions table is recreated empty |
+| CloudWatch logs | ❌ No | Log groups recreated (old logs deleted) |
+
+### Idle Timeout Lambda
+
+The `claude-cloud-agent-idle-timeout` Lambda runs every 10 minutes to stop ECS tasks that have been idle for 60+ minutes. This prevents runaway costs from forgotten containers.
+
+- **Schedule:** Every 10 minutes (EventBridge rule)
+- **Timeout threshold:** 60 minutes of inactivity
+- **Actions:** Stops ECS tasks, cleans up ALB rules, updates DynamoDB sessions
 
 ---
 
