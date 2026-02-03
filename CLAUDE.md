@@ -58,7 +58,22 @@ When `claude-dev` label is added to a GitHub issue:
 3. Agent processes issue body, posts updates to PR
 4. Container runs dev server at `{session-id}.uat.teammobot.dev`
 
-### 2. test_tickets UAT Environments
+### 2. JIRA Issue → Claude Agent
+
+When `claude-dev` label is added to a JIRA issue in a mapped project:
+1. JIRA webhook fires to `https://webhook.uat.teammobot.dev/webhook`
+2. Lambda maps JIRA project to GitHub repo (e.g., `AGNTS` → `team-mobot/test_tickets`)
+3. Creates branch `claude/{jira-key}` (e.g., `claude/agnts-125`) and draft PR
+4. ECS task launches with `claude-agent` container
+5. Agent processes JIRA issue description as initial prompt
+6. Posts comment back to JIRA issue with link to GitHub PR
+
+**Project mapping:** Configured in `claude-cloud-agent/jira` Secrets Manager secret.
+
+**Current mapping:**
+- `AGNTS` → `team-mobot/test_tickets`
+
+### 3. test_tickets UAT Environments
 
 When `uat` or `uat-staging` label is added to a PR in `team-mobot/test_tickets`:
 1. Lambda launches `test-tickets-uat` container
@@ -454,3 +469,50 @@ The original CloudFormation ALB was deleted outside of IaC, causing UAT proxy fa
 5. Full destroy/recreate test passed 2026-02-02
 
 All infrastructure is now fully managed by Terraform Cloud workspace `aws-projects__claude-cloud-agent`.
+
+### JIRA Integration (Enabled 2026-02-02)
+
+JIRA integration is now fully functional. When `claude-dev` label is added to a JIRA issue, it triggers the same workflow as GitHub issues.
+
+**Configuration:**
+- `JIRA_SECRET_ARN` in Lambda env vars points to `claude-cloud-agent/jira` secret
+- Secret contains: `base_url`, `email`, `api_token`, `webhook_secret`, `project_mapping`
+- JIRA webhook configured at: teammobot.atlassian.net → Settings → System → WebHooks
+
+**Project mapping in secret:**
+```json
+{
+  "project_mapping": {
+    "AGNTS": "team-mobot/test_tickets"
+  }
+}
+```
+
+**To add a new JIRA project:**
+1. Update the `claude-cloud-agent/jira` secret in Secrets Manager
+2. Add new entry to `project_mapping`: `"PROJECT_KEY": "owner/repo"`
+
+**Verified working:** 2026-02-02, AGNTS-125 triggered session `143240fc`, created PR #287
+
+### Streaming Buffer Overflow (Fixed 2026-02-02)
+
+Claude Code can output very large JSON lines (e.g., when reading large files) that exceed Python's default 64KB readline buffer.
+
+**Symptom:**
+```
+ValueError: Separator is not found, and chunk exceed the limit
+```
+
+**Fix:** Changed `claude_runner.py` from using `readline()` to reading 1MB chunks and manually splitting on newlines.
+
+**Lesson learned:** Always use chunked reading with manual line splitting when processing potentially large streaming output. Never rely on `readline()` for unbounded input.
+
+### JIRA Webhook Label Detection
+
+JIRA webhooks only fire on label *changes*, not on issue creation with a label already set.
+
+**To trigger the workflow:**
+- Add the `claude-dev` label to an existing issue, OR
+- Create the issue first, then add the label separately
+
+**Does NOT work:** Creating an issue with `claude-dev` label already set via API.
