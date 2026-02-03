@@ -151,7 +151,9 @@ if [ -n "$SESSION_ID" ] && [ -n "$ALB_LISTENER_ARN" ] && [ -n "$VPC_ID" ]; then
             --query 'Rules[*].Priority' \
             --output text 2>/dev/null | tr '\t' '\n' | grep -v default | sort -n)
 
-        PRIORITY=10
+        # IMPORTANT: Start at 1 to ensure specific subdomain rules have higher priority
+        # than the wildcard rule at priority 10. Lower number = evaluated first.
+        PRIORITY=1
         while echo "$EXISTING" | grep -q "^${PRIORITY}$"; do
             PRIORITY=$((PRIORITY + 1))
         done
