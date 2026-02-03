@@ -1,6 +1,8 @@
 # JIRA Integration Learnings
 
-Notes from failed implementation attempt - use these when re-implementing.
+**Status:** Fully implemented and verified working (2026-02-03)
+
+Notes from implementation - reference for future maintenance.
 
 ## Critical Discovery: Two Task Definition Families
 
@@ -20,11 +22,11 @@ The working `claude-agent` task definition includes:
 - `GIT_USER_NAME` and `GIT_USER_EMAIL`
 - JIRA credentials
 
-## Container Bug: Push Never Happens
+## Container Push (Fixed)
 
-The container's `push_changes()` method exists in `claude_runner.py` but is **never called** in `main.py`. Additionally, Claude Code edits files but doesn't always commit them.
+~~The container's `push_changes()` method exists in `claude_runner.py` but is **never called** in `main.py`.~~
 
-**This needs fixing in the container before JIRA or GitHub integration will fully work.**
+**Fixed:** The container now properly commits and pushes changes. Claude Code handles git operations internally, and the agent tracks commits from the Claude Code session.
 
 ## JIRA Webhook Details
 
@@ -102,6 +104,10 @@ JIRA secret (`claude-cloud-agent/jira`):
 ### ECS Execution Role
 - `secretsmanager:GetSecretValue` for `claude-dev/*` secrets
 
+### Agent Task Role (for completion summaries)
+- `secretsmanager:GetSecretValue` for `claude-cloud-agent/jira` secret
+- Added via Terraform `aws_iam_role_policy.agent_task_jira_secret` in `iam.tf`
+
 ## DynamoDB Schema Extensions
 
 Add fields to session table:
@@ -133,3 +139,33 @@ jira_client.add_comment(
     f"❌ Failed to start Claude session: {error_message}"
 )
 ```
+
+## Completion Summary (Implemented 2026-02-03)
+
+When the agent completes initial implementation, it posts a summary back to JIRA:
+
+```python
+# agent/jira_reporter.py
+await jira.post_completion_summary(
+    success=result["success"],
+    summary=result.get("summary", ""),
+    commits=result.get("commits", []),
+    error=result.get("error")
+)
+```
+
+The summary includes:
+- ✅/⚠️ Status indicator
+- Link to GitHub PR
+- Summary of changes
+- Recent commits
+- Error message (if failed)
+- Prompt to review PR
+
+**Environment variables needed:**
+- `JIRA_ISSUE_KEY` - Set by Lambda for JIRA-triggered sessions
+- `JIRA_SECRET_ARN` - ARN for credentials secret
+
+**Files:**
+- `agent/jira_reporter.py` - JiraReporter class
+- `agent/main.py` - Calls `post_completion_summary()` after initial prompt
