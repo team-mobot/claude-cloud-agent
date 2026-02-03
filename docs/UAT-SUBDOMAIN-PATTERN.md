@@ -502,6 +502,9 @@ After Terraform apply succeeds, manually clean up any remaining dynamic resource
 |---------|----------|-------------------|---------|
 | test-tickets-uat | `test-tickets-uat` | `tt-{branch}.uat.teammobot.dev` | `uat` label on PR |
 | claude-agent | `claude-agent` | `{session-id}.uat.teammobot.dev` | `claude-dev` label on issue |
+| product-conversation-agent | `product-conversation-agent` | `product-conv.uat.teammobot.dev` | Manual `./deploy.sh launch` |
+
+See `team-mobot/product-conversation-agent` for a complete example of a service using this pattern.
 
 ## Troubleshooting
 
