@@ -9,6 +9,7 @@ agent/                    # Claude agent container (Python)
   main.py                 # Agent orchestrator entry point
   claude_runner.py        # Runs Claude Code CLI with streaming
   github_reporter.py      # Posts status updates to GitHub PRs
+  jira_reporter.py        # Posts completion summaries to JIRA
   session_reporter.py     # Updates DynamoDB session state
   dev_server.py           # Manages project dev servers
   api_server.py           # HTTP API for receiving prompts
@@ -66,7 +67,8 @@ When `claude-dev` label is added to a JIRA issue in a mapped project:
 3. Creates branch `claude/{jira-key}` (e.g., `claude/agnts-125`) and draft PR
 4. ECS task launches with `claude-agent` container
 5. Agent processes JIRA issue description as initial prompt
-6. Posts comment back to JIRA issue with link to GitHub PR
+6. Posts "Claude Agent Started" comment to JIRA with link to GitHub PR
+7. When initial implementation completes, posts summary comment to JIRA with status, PR link, and commits
 
 **Project mapping:** Configured in `claude-cloud-agent/jira` Secrets Manager secret.
 
@@ -179,6 +181,7 @@ See `test-tickets-uat/DEPLOY.md` for details.
 | UAT Proxy Task Def | `claude-cloud-agent-uat-proxy` |
 | Sessions Table | `claude-cloud-agent-sessions` |
 | GitHub Secret | `claude-dev/github-app` |
+| JIRA Secret | `claude-cloud-agent/jira` |
 | Webhook Domain | `webhook.uat.teammobot.dev` |
 | ECR (agent) | `claude-agent` |
 | ECR (UAT proxy) | `claude-cloud-agent-uat-proxy` |
@@ -470,14 +473,15 @@ The original CloudFormation ALB was deleted outside of IaC, causing UAT proxy fa
 
 All infrastructure is now fully managed by Terraform Cloud workspace `aws-projects__claude-cloud-agent`.
 
-### JIRA Integration (Enabled 2026-02-02)
+### JIRA Integration (Enabled 2026-02-02, Enhanced 2026-02-03)
 
-JIRA integration is now fully functional. When `claude-dev` label is added to a JIRA issue, it triggers the same workflow as GitHub issues.
+JIRA integration is now fully functional. When `claude-dev` label is added to a JIRA issue, it triggers the same workflow as GitHub issues. When work completes, a summary is posted back to the JIRA issue.
 
 **Configuration:**
 - `JIRA_SECRET_ARN` in Lambda env vars points to `claude-cloud-agent/jira` secret
 - Secret contains: `base_url`, `email`, `api_token`, `webhook_secret`, `project_mapping`
 - JIRA webhook configured at: teammobot.atlassian.net → Settings → System → WebHooks
+- Agent task role has IAM permission to read `claude-cloud-agent/jira` secret
 
 **Project mapping in secret:**
 ```json
@@ -492,7 +496,13 @@ JIRA integration is now fully functional. When `claude-dev` label is added to a 
 1. Update the `claude-cloud-agent/jira` secret in Secrets Manager
 2. Add new entry to `project_mapping`: `"PROJECT_KEY": "owner/repo"`
 
-**Verified working:** 2026-02-02, AGNTS-125 triggered session `143240fc`, created PR #287
+**JIRA comments posted:**
+1. "Claude Agent Started" - When session begins, with link to GitHub PR
+2. Completion summary - When initial implementation finishes, with status, summary, and commits
+
+**Verified working:**
+- 2026-02-02: AGNTS-125 triggered session `143240fc`, created PR #287
+- 2026-02-03: AGNTS-131 received completion summary with PR link and change summary
 
 ### Streaming Buffer Overflow (Fixed 2026-02-02)
 
@@ -543,10 +553,11 @@ When the agent completes initial implementation, it posts a summary comment to J
 - `agent/jira_reporter.py` - New module to post comments to JIRA
 - `agent/main.py` - Posts completion summary after initial prompt completes
 - Credentials fetched from Secrets Manager via `JIRA_SECRET_ARN` env var
+- `iam.tf` - Added `JiraSecretsAccess` policy to `AgentTaskRole` (Terraform run `run-RsRdERsFAQuYiKqR`)
 
 **Requirements:**
 - `JIRA_ISSUE_KEY` - Set by ECS launcher for JIRA-triggered sessions
-- `JIRA_SECRET_ARN` - ARN for JIRA credentials in Secrets Manager
+- `JIRA_SECRET_ARN` - ARN for JIRA credentials in Secrets Manager (must be set in `terraform.tfvars`)
 
 **Verified working:** 2026-02-03, AGNTS-131 received completion summary with PR link and change summary
 
