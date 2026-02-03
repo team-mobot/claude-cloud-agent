@@ -61,14 +61,18 @@ When `claude-dev` label is added to a GitHub issue:
 
 ### 2. JIRA Issue → Claude Agent
 
-When `claude-dev` label is added to a JIRA issue in a mapped project:
+When `claude-dev` or `claude-dev-staging` label is added to a JIRA issue in a mapped project:
 1. JIRA webhook fires to `https://webhook.uat.teammobot.dev/webhook`
 2. Lambda maps JIRA project to GitHub repo (e.g., `AGNTS` → `team-mobot/test_tickets`)
 3. Creates branch `claude/{jira-key}` (e.g., `claude/agnts-125`) and draft PR
-4. ECS task launches with `claude-agent` container
+4. ECS task launches with `claude-agent` container (`:staging` or `:latest` based on label)
 5. Agent processes JIRA issue description as initial prompt
-6. Posts "Claude Agent Started" comment to JIRA with link to GitHub PR
+6. Posts "Claude Agent Started" comment to JIRA with link to GitHub PR (shows "(Staging)" if staging)
 7. When initial implementation completes, posts summary comment to JIRA with status, PR link, and commits
+
+**Labels:**
+- `claude-dev` → Uses `:latest` image (production)
+- `claude-dev-staging` → Uses `:staging` image (testing agent changes)
 
 **Project mapping:** Configured in `claude-cloud-agent/jira` Secrets Manager secret.
 
