@@ -32,6 +32,7 @@ test-tickets-uat/         # UAT container for test_tickets repo
 docs/
   DESIGN.md               # Architecture and design decisions
   TEST-TICKETS-UAT.md     # Full UAT documentation
+  UAT-SUBDOMAIN-PATTERN.md # How to create new *.uat.teammobot.dev services
 ```
 
 ## GitHub App Configuration
@@ -89,6 +90,61 @@ When `uat` or `uat-staging` label is added to a PR in `team-mobot/test_tickets`:
 **Labels:**
 - `uat` → Uses `:latest` image (production)
 - `uat-staging` → Uses `:staging` image (testing container changes)
+
+### 4. Creating New UAT Services (Dynamic Subdomain Pattern)
+
+Any container can self-register to get a subdomain under `*.uat.teammobot.dev` without Terraform changes. This is ideal for:
+- Development/prototyping new services
+- Ephemeral per-session environments
+- Quick iteration without deployment cycles
+
+**How it works:**
+1. Container starts with `SESSION_ID` env var
+2. Entrypoint script creates target group and ALB listener rule
+3. Service immediately available at `https://{SESSION_ID}.uat.teammobot.dev`
+4. Idle timeout Lambda auto-cleans up after 60 minutes
+
+**Full documentation:** See `docs/UAT-SUBDOMAIN-PATTERN.md`
+
+**Infrastructure values for new services:**
+
+| Resource | Value |
+|----------|-------|
+| ALB Listener ARN | `arn:aws:elasticloadbalancing:us-east-1:678954237808:listener/app/test-tickets-uat-alb/7e47b6b368ee29e1/9b650b437fde8e6f` |
+| VPC ID | `vpc-0fde49947ce39aec4` |
+| Subnets | `subnet-016037c717cc89fb2`, `subnet-0ede91cdf265af677` |
+| Security Group | `sg-0c6486526730186cb` (claude-cloud-agent-sg) |
+| ECS Cluster | `claude-cloud-agent` |
+| Sessions Table | `claude-cloud-agent-sessions` |
+| Domain Suffix | `uat.teammobot.dev` |
+| Execution Role | `arn:aws:iam::678954237808:role/claude-cloud-agent-AgentExecutionRole` |
+| Task Role | `arn:aws:iam::678954237808:role/claude-cloud-agent-AgentTaskRole` |
+
+**Quick start for a new service:**
+
+```bash
+# 1. Create ECR repo
+aws ecr create-repository --repository-name my-service --region us-east-1
+
+# 2. Build and push (see docs/UAT-SUBDOMAIN-PATTERN.md for Dockerfile template)
+docker build --platform linux/amd64 -t my-service .
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 678954237808.dkr.ecr.us-east-1.amazonaws.com
+docker tag my-service:latest 678954237808.dkr.ecr.us-east-1.amazonaws.com/my-service:latest
+docker push 678954237808.dkr.ecr.us-east-1.amazonaws.com/my-service:latest
+
+# 3. Register task definition (see docs/UAT-SUBDOMAIN-PATTERN.md for template)
+aws ecs register-task-definition --cli-input-json file://task-definition.json
+
+# 4. Launch
+aws ecs run-task \
+  --cluster claude-cloud-agent \
+  --task-definition my-service \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-016037c717cc89fb2,subnet-0ede91cdf265af677],securityGroups=[sg-0c6486526730186cb],assignPublicIp=ENABLED}" \
+  --overrides '{"containerOverrides":[{"name":"my-service","environment":[{"name":"SESSION_ID","value":"my-service-dev"}]}]}'
+
+# Service available at https://my-service-dev.uat.teammobot.dev
+```
 
 ## Deploying Changes
 
@@ -601,6 +657,34 @@ The original CloudFormation ALB was deleted outside of IaC, causing UAT proxy fa
 3. Terraform now manages everything from scratch
 4. Uses existing `test-tickets-uat-alb` (shared with test-tickets project)
 5. Full destroy/recreate test passed 2026-02-02
+
+### UAT Subdomain Self-Registration Requirements (Added 2026-02-03)
+
+For the dynamic UAT subdomain pattern to work, containers need both IAM permissions AND security group rules.
+
+**IAM permissions required on task role:**
+- `elasticloadbalancing:CreateTargetGroup`, `DeleteTargetGroup`, `DescribeTargetGroups`
+- `elasticloadbalancing:RegisterTargets`, `DeregisterTargets`
+- `elasticloadbalancing:CreateRule`, `DeleteRule`, `DescribeRules`
+
+The `ELBAccess` policy was added to `claude-cloud-agent-AgentTaskRole` on 2026-02-03.
+
+**Security group requirement:**
+The container security group must allow inbound traffic from the ALB security group on the service port.
+
+```bash
+# Allow ALB (sg-01e33c097eb569074) to reach containers on port 3000
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0c6486526730186cb \
+  --protocol tcp \
+  --port 3000 \
+  --source-group sg-01e33c097eb569074 \
+  --region us-east-1
+```
+
+This rule was added 2026-02-03. Without it, ALB health checks timeout and targets remain unhealthy.
+
+**Key insight:** The Terraform-managed security group rules only allowed traffic from the proxy SG, not directly from the ALB SG. Dynamic self-registration bypasses the proxy, requiring direct ALB access.
 
 All infrastructure is now fully managed by Terraform Cloud workspace `aws-projects__claude-cloud-agent`.
 
