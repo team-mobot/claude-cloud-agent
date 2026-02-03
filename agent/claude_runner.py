@@ -136,41 +136,65 @@ class ClaudeRunner:
 
         summary_parts = []
         pending_tool_uses = {}  # Track tool_use_id -> (name, input)
+        buffer = b""  # Buffer for incomplete lines
 
         try:
-            # Read stdout line by line
+            # Read stdout in chunks to handle large JSON lines
+            # (readline() has a 64KB limit which Claude Code can exceed)
             while True:
-                line = await asyncio.wait_for(
-                    process.stdout.readline(),
-                    timeout=600  # 10 minute timeout
-                )
+                try:
+                    chunk = await asyncio.wait_for(
+                        process.stdout.read(1024 * 1024),  # Read up to 1MB at a time
+                        timeout=600  # 10 minute timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Claude Code timed out")
+                    process.kill()
+                    return {"returncode": -1, "stderr": "Timeout"}
 
-                if not line:
+                if not chunk:
+                    # Process any remaining data in buffer
+                    if buffer:
+                        line_str = buffer.decode("utf-8").strip()
+                        if line_str:
+                            try:
+                                data = json.loads(line_str)
+                                await self._handle_stream_event(
+                                    data, pending_tool_uses, summary_parts,
+                                    on_tool_use, on_tool_result, on_text,
+                                )
+                            except json.JSONDecodeError:
+                                logger.debug(f"Non-JSON output: {line_str[:200]}")
                     break
 
-                line_str = line.decode("utf-8").strip()
-                if not line_str:
-                    continue
+                buffer += chunk
 
-                # Try to parse as JSON
-                try:
-                    data = json.loads(line_str)
-                    await self._handle_stream_event(
-                        data,
-                        pending_tool_uses,
-                        summary_parts,
-                        on_tool_use,
-                        on_tool_result,
-                        on_text,
-                    )
-                except json.JSONDecodeError:
-                    # Not JSON, log it
-                    logger.debug(f"Non-JSON output: {line_str[:200]}")
+                # Process complete lines from buffer
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line_str = line.decode("utf-8").strip()
+                    if not line_str:
+                        continue
 
-        except asyncio.TimeoutError:
-            logger.error("Claude Code timed out")
+                    # Try to parse as JSON
+                    try:
+                        data = json.loads(line_str)
+                        await self._handle_stream_event(
+                            data,
+                            pending_tool_uses,
+                            summary_parts,
+                            on_tool_use,
+                            on_tool_result,
+                            on_text,
+                        )
+                    except json.JSONDecodeError:
+                        # Not JSON, log it
+                        logger.debug(f"Non-JSON output: {line_str[:200]}")
+
+        except Exception as e:
+            logger.error(f"Error reading Claude Code output: {e}")
             process.kill()
-            return {"returncode": -1, "stderr": "Timeout"}
+            return {"returncode": -1, "stderr": str(e)}
 
         # Wait for process to complete
         await process.wait()
