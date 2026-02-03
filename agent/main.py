@@ -24,6 +24,7 @@ from api_server import app, prompt_queue
 from claude_runner import ClaudeRunner
 from session_reporter import SessionReporter
 from github_reporter import GitHubReporter, StreamingReporter
+from jira_reporter import JiraReporter
 from dev_server import DevServerManager
 
 # Configure logging
@@ -194,6 +195,7 @@ async def main():
     # Initialize components
     session = SessionReporter()
     github = GitHubReporter()
+    jira = JiraReporter()
     claude = ClaudeRunner(workspace)
     dev_server = DevServerManager(workspace)
 
@@ -217,6 +219,13 @@ async def main():
         logger.info("Dev server started on port 3001 (proxied via API server on 3000)")
     else:
         logger.warning("Could not auto-detect dev server")
+
+    # Start API server immediately so PR comments can be received during initial prompt processing
+    logger.info("Starting API server on port 3000...")
+    api_server_task = asyncio.create_task(run_api_server())
+    # Give it a moment to start
+    await asyncio.sleep(0.5)
+    logger.info("API server started, ready to receive prompts")
 
     # Process initial prompt
     if INITIAL_PROMPT:
@@ -253,12 +262,22 @@ async def main():
                 f"<!-- claude-agent -->\n:warning: **Error during initial implementation**\n\n```\n{result.get('error', 'Unknown error')}\n```"
             )
 
-    # Start background tasks
+        # Post summary to JIRA if this was a JIRA-triggered session
+        if jira.enabled:
+            summary = result.get("summary", "Initial implementation completed.")
+            await jira.post_completion_summary(
+                success=result["success"],
+                summary=summary,
+                commits=result.get("commits", []),
+                error=result.get("error")
+            )
+
+    # Start background tasks (API server already running)
     logger.info("Starting prompt processing loop...")
 
     try:
         await asyncio.gather(
-            run_api_server(),
+            api_server_task,  # Already running, just await it
             process_prompts(claude, github, session),
             check_idle_timeout(github),
         )

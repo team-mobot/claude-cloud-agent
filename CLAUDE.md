@@ -516,3 +516,54 @@ JIRA webhooks only fire on label *changes*, not on issue creation with a label a
 - Create the issue first, then add the label separately
 
 **Does NOT work:** Creating an issue with `claude-dev` label already set via API.
+
+### API Server Startup Order (Fixed 2026-02-03)
+
+The API server must start BEFORE processing the initial prompt so PR comments can be received during initial work.
+
+**Previous issue:** API server only started after initial prompt completed (in `asyncio.gather()`), causing 502 errors when webhook forwarded PR comments during initial processing.
+
+**Fix:** Start API server as a background task immediately after dev server starts, before processing initial prompt.
+
+**Files changed:**
+- `agent/main.py` - Start API server with `asyncio.create_task()` before initial prompt
+
+**Verified working:** 2026-02-03, session `7b181de6` received PR comment during initial prompt processing via `https://7b181de6.uat.teammobot.dev/prompt`
+
+### JIRA Summary Comment (Implemented 2026-02-03)
+
+When the agent completes initial implementation, it posts a summary comment to JIRA with:
+- Link to the GitHub PR
+- Status (success/failure)
+- Summary of changes made
+- Recent commits
+- Error message if failed
+
+**Implementation:**
+- `agent/jira_reporter.py` - New module to post comments to JIRA
+- `agent/main.py` - Posts completion summary after initial prompt completes
+- Credentials fetched from Secrets Manager via `JIRA_SECRET_ARN` env var
+
+**Requirements:**
+- `JIRA_ISSUE_KEY` - Set by ECS launcher for JIRA-triggered sessions
+- `JIRA_SECRET_ARN` - ARN for JIRA credentials in Secrets Manager
+
+**Verified working:** 2026-02-03, AGNTS-131 received completion summary with PR link and change summary
+
+### Claude Loop Issue (Observed 2026-02-03)
+
+In E2E testing, Claude sometimes gets stuck in a loop repeating the same action (e.g., running `npm install` repeatedly).
+
+**Observed in:** Session `a84fce23` for AGNTS-128 (dark mode toggle task)
+
+**Symptoms:**
+- Same tool call repeated many times
+- PR comments show identical output repeatedly
+- Agent doesn't progress to next steps
+
+**Potential causes:**
+- Complex prompts with multiple requirements
+- Context window pressure
+- Prompt engineering issues
+
+**Workaround:** Stop the ECS task and retry with a simpler, more specific prompt.
