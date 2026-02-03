@@ -125,14 +125,24 @@ aws lambda update-function-code \
 
 The agent container runs Claude Code to process GitHub issues/PRs.
 
+**Always use the staging workflow for changes:**
+
 ```bash
 cd agent
 
 # 1. Build the image for linux/amd64 (required for ECS Fargate)
 docker build --platform linux/amd64 -t claude-agent .
 
-# 2. Tag and push to ECR
+# 2. Login to ECR
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 678954237808.dkr.ecr.us-east-1.amazonaws.com
+
+# 3. Push to :staging first
+docker tag claude-agent:latest 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:staging
+docker push 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:staging
+
+# 4. Test with 'claude-dev-staging' label on a JIRA issue (see Staging Workflow section)
+
+# 5. After validation, promote to production
 docker tag claude-agent:latest 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest
 docker push 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest
 ```
@@ -169,6 +179,123 @@ cd test-tickets-uat
 ```
 
 See `test-tickets-uat/DEPLOY.md` for details.
+
+## Development, Staging, Production Workflow
+
+This section describes how to safely develop, test, and deploy changes to the Claude Cloud Agent system.
+
+### Overview
+
+Both `claude-agent` and `test-tickets-uat` containers support a staging workflow:
+
+| Container | Production Label | Staging Label | Production Image | Staging Image |
+|-----------|-----------------|---------------|------------------|---------------|
+| claude-agent | `claude-dev` | `claude-dev-staging` | `:latest` | `:staging` |
+| test-tickets-uat | `uat` | `uat-staging` | `:latest` | `:staging` |
+
+### Staging Labels
+
+**JIRA:**
+- `claude-dev` → Uses `claude-agent:latest` (production)
+- `claude-dev-staging` → Uses `claude-agent:staging` (testing)
+
+**GitHub (test_tickets repo):**
+- `uat` → Uses `test-tickets-uat:latest` (production)
+- `uat-staging` → Uses `test-tickets-uat:staging` (testing)
+
+### claude-agent Staging Workflow
+
+1. **Make code changes** in `agent/` directory
+
+2. **Build and push to staging:**
+   ```bash
+   cd agent
+   docker build --platform linux/amd64 -t claude-agent .
+   aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 678954237808.dkr.ecr.us-east-1.amazonaws.com
+   docker tag claude-agent:latest 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:staging
+   docker push 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:staging
+   ```
+
+3. **Test with staging label:**
+   - Create a JIRA issue in AGNTS project (or another mapped project)
+   - Add the `claude-dev-staging` label
+   - Verify the JIRA comment shows "Claude Agent Started **(Staging)**"
+   - Monitor the PR for expected behavior
+
+4. **Promote to production after validation:**
+   ```bash
+   # Pull staging and push as latest
+   docker pull --platform linux/amd64 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:staging
+   docker tag 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:staging 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest
+   docker push 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest
+   ```
+
+### test-tickets-uat Staging Workflow
+
+Use the deploy script:
+
+```bash
+cd test-tickets-uat
+
+# 1. Build and push to staging
+./deploy.sh staging
+
+# 2. Test with 'uat-staging' label on a PR in test_tickets repo
+
+# 3. Promote to production
+./deploy.sh promote
+```
+
+### Lambda Code Staging
+
+Lambda code doesn't have a separate staging environment. Changes are tested by:
+1. Deploying to the single Lambda function
+2. Testing with staging container labels (which use different task definitions)
+3. If issues found, rollback by redeploying previous version
+
+### Terraform/Infrastructure Staging
+
+Infrastructure changes follow the standard Terraform workflow:
+1. Edit files on feature branch
+2. Merge to `terraform-cloud` branch
+3. Push triggers plan in Terraform Cloud
+4. Review plan output
+5. Manual approval required to apply
+
+### Sync Staging with Production
+
+Before testing changes, ensure staging matches production:
+
+```bash
+# Sync claude-agent staging with latest
+docker pull --platform linux/amd64 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest
+docker tag 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:staging
+docker push 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:staging
+
+# Sync test-tickets-uat staging with latest
+cd test-tickets-uat
+./deploy.sh sync  # If available, or manually pull/tag/push
+```
+
+### Rollback Procedures
+
+**Container rollback:**
+```bash
+# Find previous image digest
+aws ecr describe-images --repository-name claude-agent --region us-east-1 \
+  --query 'imageDetails | sort_by(@, &imagePushedAt) | reverse(@) | [0:5]'
+
+# Tag a known-good digest as latest
+docker pull 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent@sha256:<known-good-digest>
+docker tag 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent@sha256:<known-good-digest> 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest
+docker push 678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:latest
+```
+
+**Lambda rollback:**
+Keep a copy of working Python files. Redeploy from backup if needed.
+
+**Terraform rollback:**
+Use Terraform Cloud UI to view previous states and trigger a new apply with reverted changes.
 
 ## AWS Resources
 
@@ -475,7 +602,11 @@ All infrastructure is now fully managed by Terraform Cloud workspace `aws-projec
 
 ### JIRA Integration (Enabled 2026-02-02, Enhanced 2026-02-03)
 
-JIRA integration is now fully functional. When `claude-dev` label is added to a JIRA issue, it triggers the same workflow as GitHub issues. When work completes, a summary is posted back to the JIRA issue.
+JIRA integration is now fully functional. When `claude-dev` or `claude-dev-staging` label is added to a JIRA issue, it triggers the same workflow as GitHub issues. When work completes, a summary is posted back to the JIRA issue.
+
+**Supported labels:**
+- `claude-dev` → Uses `claude-agent:latest` (production)
+- `claude-dev-staging` → Uses `claude-agent:staging` (for testing agent changes)
 
 **Configuration:**
 - `JIRA_SECRET_ARN` in Lambda env vars points to `claude-cloud-agent/jira` secret
@@ -497,12 +628,13 @@ JIRA integration is now fully functional. When `claude-dev` label is added to a 
 2. Add new entry to `project_mapping`: `"PROJECT_KEY": "owner/repo"`
 
 **JIRA comments posted:**
-1. "Claude Agent Started" - When session begins, with link to GitHub PR
+1. "Claude Agent Started" (or "Claude Agent Started (Staging)" for staging) - When session begins, with link to GitHub PR
 2. Completion summary - When initial implementation finishes, with status, summary, and commits
 
 **Verified working:**
 - 2026-02-02: AGNTS-125 triggered session `143240fc`, created PR #287
 - 2026-02-03: AGNTS-131 received completion summary with PR link and change summary
+- 2026-02-03: AGNTS-135 tested `claude-dev-staging` label, session `1c56b8fb`, PR #302
 
 ### Streaming Buffer Overflow (Fixed 2026-02-02)
 

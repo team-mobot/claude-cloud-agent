@@ -33,8 +33,9 @@ TEST_TICKETS_TASK_DEFINITION = os.environ.get("TEST_TICKETS_TASK_DEFINITION", ""
 TEST_TICKETS_SECRET_ARN = os.environ.get("TEST_TICKETS_SECRET_ARN", "")
 ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 
-# Trigger label that starts a session
+# Trigger labels that start a session
 TRIGGER_LABEL = "claude-dev"
+TRIGGER_STAGING_LABEL = "claude-dev-staging"  # Uses :staging image instead of :latest
 
 # test_tickets UAT configuration
 TEST_TICKETS_TRIGGER_LABEL = "uat"
@@ -1172,8 +1173,11 @@ def handle_jira_webhook(headers: dict, body: str) -> dict:
                 to_labels = set((item.get("toString") or "").split())
                 added_labels = to_labels - from_labels
 
-                if TRIGGER_LABEL in added_labels:
-                    return handle_jira_issue_labeled(payload)
+                # Check for staging label first (more specific)
+                if TRIGGER_STAGING_LABEL in added_labels:
+                    return handle_jira_issue_labeled(payload, image_tag="staging")
+                elif TRIGGER_LABEL in added_labels:
+                    return handle_jira_issue_labeled(payload, image_tag="latest")
 
         logger.info("JIRA issue updated but not a claude-dev label addition")
         return {
@@ -1188,12 +1192,16 @@ def handle_jira_webhook(headers: dict, body: str) -> dict:
     }
 
 
-def handle_jira_issue_labeled(payload: dict) -> dict:
+def handle_jira_issue_labeled(payload: dict, image_tag: str = "latest") -> dict:
     """
-    Handle JIRA issue labeled with claude-dev.
+    Handle JIRA issue labeled with claude-dev or claude-dev-staging.
 
     Creates a GitHub branch/PR and starts an agent session,
     similar to the GitHub issue labeled flow.
+
+    Args:
+        payload: JIRA webhook payload
+        image_tag: Docker image tag to use ("latest" or "staging")
     """
     import uuid
 
@@ -1378,7 +1386,7 @@ Implement the requirements described above. When complete, commit and push your 
     jira_base_url = jira_secret.get("base_url", "")
     jira_site = jira_base_url.replace("https://", "").replace("http://", "").rstrip("/")
 
-    logger.info(f"Launching ECS task for session {session_id}")
+    logger.info(f"Launching ECS task for session {session_id} (image_tag={image_tag})")
     try:
         task_arn = ecs.launch_agent_task(
             session_id=session_id,
@@ -1394,7 +1402,8 @@ Implement the requirements described above. When complete, commit and push your 
             jira_issue_key=issue_key,
             jira_site=jira_site,
             jira_secret_arn=JIRA_SECRET_ARN,
-            github_secret_arn=GITHUB_APP_SECRET_ARN
+            github_secret_arn=GITHUB_APP_SECRET_ARN,
+            image_tag=image_tag
         )
     except Exception as e:
         logger.error(f"Failed to launch ECS task: {e}")
@@ -1415,14 +1424,19 @@ Implement the requirements described above. When complete, commit and push your 
             api_token=jira_secret.get("api_token")
         )
         pr_url = f"https://github.com/{repo_full_name}/pull/{pr_number}"
+        # Include image tag in title if using staging
+        title = "Claude Agent Started (Staging)" if image_tag == "staging" else "Claude Agent Started"
+        fields = {
+            "GitHub PR": pr_url,
+            "Session ID": session_id,
+            "Branch": branch_name
+        }
+        if image_tag == "staging":
+            fields["Image"] = f"claude-agent:{image_tag}"
         jira.add_formatted_comment(
             issue_key=issue_key,
-            title="Claude Agent Started",
-            fields={
-                "GitHub PR": pr_url,
-                "Session ID": session_id,
-                "Branch": branch_name
-            },
+            title=title,
+            fields=fields,
             footer="Follow progress and provide feedback on the GitHub PR."
         )
         logger.info(f"Posted JIRA comment for {issue_key}")
@@ -1430,7 +1444,7 @@ Implement the requirements described above. When complete, commit and push your 
         logger.warning(f"Failed to post JIRA comment: {e}")
         # Don't fail the request if JIRA comment fails
 
-    logger.info(f"Session {session_id} started successfully for JIRA {issue_key}")
+    logger.info(f"Session {session_id} started successfully for JIRA {issue_key} (image_tag={image_tag})")
     return {
         "statusCode": 200,
         "body": json.dumps({
@@ -1438,6 +1452,7 @@ Implement the requirements described above. When complete, commit and push your 
             "session_id": session_id,
             "jira_issue_key": issue_key,
             "pr_number": pr_number,
-            "task_arn": task_arn
+            "task_arn": task_arn,
+            "image_tag": image_tag
         })
     }

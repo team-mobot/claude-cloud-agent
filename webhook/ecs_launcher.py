@@ -32,6 +32,11 @@ class ECSLauncher:
             "TEST_TICKETS_IMAGE_URI",
             "678954237808.dkr.ecr.us-east-1.amazonaws.com/test-tickets-uat"
         )
+        # claude-agent image configuration
+        self.agent_image_uri = os.environ.get(
+            "AGENT_IMAGE_URI",
+            "678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent"
+        )
         self._ecs_client = None
 
     @property
@@ -56,7 +61,8 @@ class ECSLauncher:
         jira_issue_key: str = "",
         jira_site: str = "",
         jira_secret_arn: str = "",
-        github_secret_arn: str = ""
+        github_secret_arn: str = "",
+        image_tag: str = "latest"
     ) -> str:
         """
         Launch an ECS task for an agent session.
@@ -76,6 +82,7 @@ class ECSLauncher:
             jira_site: JIRA site hostname (e.g., "teammobot.atlassian.net")
             jira_secret_arn: ARN for JIRA credentials secret
             github_secret_arn: ARN for GitHub App secret
+            image_tag: Docker image tag (default: "latest", use "staging" for testing)
 
         Returns:
             Task ARN
@@ -114,14 +121,28 @@ class ECSLauncher:
         if github_secret_arn:
             env_overrides.append({"name": "GITHUB_SECRET_ARN", "value": github_secret_arn})
 
+        # Construct the full image URI with tag
+        image_uri = f"{self.agent_image_uri}:{image_tag}"
+
+        # Determine which task definition to use
+        # If using a non-default image tag, register a new task definition revision
+        if image_tag != "latest":
+            task_definition_arn = self._register_task_definition_with_image(
+                self.task_definition,
+                image_uri
+            )
+        else:
+            task_definition_arn = self.task_definition
+
         logger.info(f"Launching task for session {session_id}")
         logger.info(f"  Cluster: {self.cluster}")
-        logger.info(f"  Task Definition: {self.task_definition}")
+        logger.info(f"  Task Definition: {task_definition_arn}")
+        logger.info(f"  Image: {image_uri}")
         logger.info(f"  Subnets: {self.subnets}")
 
         response = self.ecs.run_task(
             cluster=self.cluster,
-            taskDefinition=self.task_definition,
+            taskDefinition=task_definition_arn,
             launchType="FARGATE",
             networkConfiguration={
                 "awsvpcConfiguration": {
@@ -141,7 +162,8 @@ class ECSLauncher:
             tags=[
                 {"key": "SessionId", "value": session_id},
                 {"key": "IssueNumber", "value": str(issue_number)},
-                {"key": "PRNumber", "value": str(pr_number)}
+                {"key": "PRNumber", "value": str(pr_number)},
+                {"key": "ImageTag", "value": image_tag}
             ]
         )
 
