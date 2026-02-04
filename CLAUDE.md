@@ -798,3 +798,120 @@ In E2E testing, Claude sometimes gets stuck in a loop repeating the same action 
 - Prompt engineering issues
 
 **Workaround:** Stop the ECS task and retry with a simpler, more specific prompt.
+
+### E2E Test Results (2026-02-04)
+
+Full E2E testing was performed on all three workflows. Results:
+
+| Workflow | Status | Notes |
+|----------|--------|-------|
+| JIRA → Claude Agent | ✅ SUCCESS | AGNTS-137 → PR #305, all features working |
+| GitHub Issue → Claude Agent | ⚠️ PARTIAL FAILURE | Issue #303 → PR #304, commit bug |
+| GitHub PR → UAT Environment | ❌ FAILED | PR #306, IAM permission error |
+
+**Test artifacts:**
+- JIRA: AGNTS-137 → PR #305 (E2E-JIRA badge added to sidebar footer)
+- GitHub Issue: #303 → PR #304 (code edit made but not committed)
+- UAT: PR #306, branch `e2e-uat-test-1770219912`
+
+### GitHub Issue Agent Not Committing Changes (Bug - 2026-02-04)
+
+**Critical bug:** When triggered via GitHub Issue (not JIRA), the agent edits files but does NOT commit them. The same agent code works correctly for JIRA-triggered sessions.
+
+**Symptom:**
+- Agent logs "Changes pushed successfully" in `claude_runner.py`
+- PR only contains the `.claude-session` file, not actual code changes
+- Agent responds to follow-up "please commit" requests with text, not tool execution
+- Response times are ~5 seconds (too fast for actual git operations)
+
+**Evidence from session `bd1d0a42` (Issue #303 → PR #304):**
+```
+# Agent says it edited the file and ran TypeScript check successfully
+# But PR diff shows only .claude-session, not the src/App.tsx changes
+# Multiple prompts asking agent to commit resulted in text responses, not git commands
+```
+
+**Root cause hypothesis:**
+The agent uses `--continue {session-id}` for follow-up prompts. When continuing a session, Claude Code may be in a state where it's responding conversationally rather than executing tools. The rapid response times (~5 seconds vs ~30+ seconds for actual tool execution) support this.
+
+**Confusing aspect:** The JIRA workflow uses the same code path and DOES commit successfully. The difference might be:
+1. Initial prompt structure differs between JIRA and GitHub Issue sources
+2. Something about how the session is initialized
+3. Race condition in the prompt processing loop
+
+**Investigation needed:**
+1. Compare initial prompts between JIRA and GitHub Issue workflows
+2. Check if `--continue` behaves differently based on initial session state
+3. Review `claude_runner.py` detection of "Changes pushed successfully" - may be too permissive
+
+**Files to investigate:**
+- `agent/claude_runner.py` - Look for how it detects push success
+- `agent/main.py` - Compare JIRA vs GitHub issue prompt construction
+- `webhook/handler.py` - Check if initial_prompt differs by source
+
+### test-tickets-uat IAM Permission Missing (2026-02-04)
+
+**Error:** Lambda cannot launch test-tickets-uat ECS tasks.
+
+```
+AccessDeniedException: User: claude-cloud-agent-WebhookLambdaRole is not authorized
+to perform: iam:PassRole on resource: arn:aws:iam::678954237808:role/test-tickets-ecs-execution-role
+```
+
+**Fix required:** Add to Terraform `iam.tf` in the WebhookLambdaRole policy:
+```hcl
+{
+  "Effect": "Allow",
+  "Action": "iam:PassRole",
+  "Resource": "arn:aws:iam::678954237808:role/test-tickets-ecs-execution-role"
+}
+```
+
+**Context:** The Lambda already has PassRole for `claude-cloud-agent-AgentExecutionRole`, but `test-tickets-uat` uses a different execution role (`test-tickets-ecs-execution-role`) that was created separately.
+
+**Note:** The `test-tickets-uat` task definition references `test-tickets-ecs-execution-role` which is NOT managed by the claude-cloud-agent Terraform. This role was created for the original test-tickets project.
+
+### Key Architecture Insight: Two Different Execution Roles
+
+The system uses two different ECS execution roles:
+
+| Container | Execution Role | Managed By |
+|-----------|---------------|------------|
+| claude-agent | `claude-cloud-agent-AgentExecutionRole` | claude-cloud-agent Terraform |
+| test-tickets-uat | `test-tickets-ecs-execution-role` | test-tickets Terraform (separate) |
+
+The Lambda has PassRole permission for the first but not the second. This is why JIRA/GitHub Issue workflows work (they use claude-agent) but UAT workflows fail (they use test-tickets-uat).
+
+### Debugging Agent Behavior: Response Time Indicator
+
+**Useful heuristic:** If Claude Code responds in ~5 seconds or less to a follow-up prompt, it's likely generating text without executing tools. Actual tool execution (especially git operations) takes 15-30+ seconds.
+
+When reviewing agent logs, look at timestamps between "Running Claude Code with prompt" and "Changes pushed successfully". If the gap is <10 seconds, the agent probably didn't actually run tools.
+
+### Monitoring Commands for E2E Testing
+
+```bash
+# Check session status in DynamoDB
+aws dynamodb scan --table-name claude-cloud-agent-sessions --region us-east-1 \
+  --query "Items[*].{session_id: session_id.S, status: status.S, pr: pr_number.N}"
+
+# Check running ECS tasks
+aws ecs list-tasks --cluster claude-cloud-agent --region us-east-1
+
+# Get task details (replace ARN)
+aws ecs describe-tasks --cluster claude-cloud-agent --tasks <task-arn> --region us-east-1 \
+  --query "tasks[*].{taskDefinition: taskDefinitionArn, status: lastStatus}"
+
+# Watch agent logs in real-time
+aws logs tail /ecs/claude-cloud-agent --since 5m --follow --region us-east-1
+
+# Check webhook Lambda logs
+aws logs tail /aws/lambda/claude-cloud-agent-webhook --since 5m --region us-east-1
+
+# Check PR commits
+gh pr view <PR-NUMBER> --repo team-mobot/test_tickets --json commits --jq '.commits[] | "\(.oid[0:7]): \(.messageHeadline)"'
+
+# Check JIRA comments (requires auth)
+curl -s "https://teammobot.atlassian.net/rest/api/3/issue/<ISSUE-KEY>/comment" \
+  -H "Authorization: Basic $(echo -n 'email:token' | base64)" | jq '.comments[].body'
+```
