@@ -395,6 +395,14 @@ URL will be posted when the agent is ready.
         branch_name=branch_name
     )
 
+    # Build initial prompt with explicit implementation instructions
+    # (Without these, Claude may respond conversationally instead of implementing)
+    initial_prompt = f"""GitHub Issue #{issue_number}: {issue_title}
+
+{issue_body}
+
+Implement the requirements described above. When complete, commit and push your changes."""
+
     # Launch ECS task with GitHub token for cloning
     logger.info(f"Launching ECS task for session {session_id}")
     task_arn = ecs.launch_agent_task(
@@ -403,7 +411,7 @@ URL will be posted when the agent is ready.
         branch_name=branch_name,
         issue_number=issue_number,
         pr_number=pr_number,
-        initial_prompt=f"Issue #{issue_number}: {issue_title}\n\n{issue_body}",
+        initial_prompt=initial_prompt,
         github_token=github.get_token(),
         installation_id=payload.get("installation", {}).get("id", 0),
         repo_full_name=repo_full_name,
