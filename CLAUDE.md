@@ -597,32 +597,123 @@ The `claude-cloud-agent-idle-timeout` Lambda runs every 10 minutes to stop ECS t
 
 ---
 
-## Known Issues
+## ⚠️ Common Regressions - READ BEFORE MAKING CHANGES
 
-### Lambda Deployment Notes
+These issues have broken the system multiple times. Follow the checklists carefully.
 
-The Lambda requires Linux binaries for cryptography. The deployment is now done from `/Users/dave/git/claude-cloud-agent/main/`:
+### 1. Lambda Cryptography Binaries (CRITICAL)
 
+**What breaks:** Lambda fails with `invalid ELF header` or `GLIBC_2.28 not found`
+
+**Why it happens:** The `cryptography` library contains platform-specific Rust binaries. If you install dependencies on macOS or rebuild the zip incorrectly, you get macOS binaries that won't run on Lambda's Amazon Linux.
+
+**Prevention checklist:**
+- [ ] NEVER run `pip install` on macOS for Lambda dependencies
+- [ ] NEVER rebuild `webhook-lambda.zip` from scratch
+- [ ] ALWAYS extract the existing zip first to preserve Linux binaries
+- [ ] ONLY copy `.py` files into the extracted directory
+- [ ] If you must rebuild dependencies, use Docker with `public.ecr.aws/lambda/python:3.11`
+
+**Correct deployment procedure:**
 ```bash
-# 1. Extract existing zip to preserve Linux dependencies
 cd /Users/dave/git/claude-cloud-agent/main
 mkdir -p webhook-deploy && cd webhook-deploy
-unzip -o ../webhook-lambda.zip
-
-# 2. Copy updated Python files
-cp ../webhook/*.py .
-
-# 3. Create new zip
-zip -r ../webhook-lambda-new.zip . -x "*.pyc" -x "__pycache__/*" -x "*.DS_Store"
-
-# 4. Deploy
+unzip -o ../webhook-lambda.zip      # Preserves Linux binaries!
+cp ../webhook/*.py .                 # Only update Python files
+zip -r ../webhook-lambda-new.zip . -x "*.pyc" -x "__pycache__/*"
 aws lambda update-function-code \
   --function-name claude-cloud-agent-webhook \
   --zip-file fileb://webhook-lambda-new.zip \
   --region us-east-1
 ```
 
-Never rebuild from scratch on macOS - always extract the existing zip and update Python files.
+**If you broke it, rebuild with Docker:**
+```bash
+docker run --rm -v $(pwd):/out public.ecr.aws/lambda/python:3.11 \
+  pip install "cryptography<43" PyJWT requests -t /out/
+```
+
+**Last broken:** 2026-02-04 (E2E test failure, fixed by agent)
+
+### 2. IAM PassRole Permissions (CRITICAL)
+
+**What breaks:** Lambda fails with `AccessDeniedException: not authorized to perform: iam:PassRole`
+
+**Why it happens:** When launching ECS tasks, Lambda must have `iam:PassRole` permission for EVERY role the task definition uses (both execution role AND task role). When you add new task definitions or roles, you must update the Lambda's IAM policy.
+
+**Prevention checklist:**
+- [ ] When adding a new ECS task definition, identify ALL roles it uses
+- [ ] Add BOTH execution role AND task role to `lambda.tf` ECSPassRole policy
+- [ ] For external roles (not managed by this Terraform), add the full ARN string
+
+**Current roles in `lambda.tf` ECSPassRole:**
+```hcl
+Resource = compact([
+  aws_iam_role.agent_execution.arn,           # claude-agent execution
+  aws_iam_role.agent_task.arn,                # claude-agent task
+  aws_iam_role.proxy_execution.arn,           # uat-proxy execution
+  aws_iam_role.proxy_task.arn,                # uat-proxy task
+  aws_iam_role.test_tickets_execution[0].arn, # test-tickets-uat execution (Terraform)
+  aws_iam_role.test_tickets_task[0].arn,      # test-tickets-uat task (Terraform)
+  "arn:aws:iam::678954237808:role/test-tickets-ecs-execution-role",  # External
+  "arn:aws:iam::678954237808:role/test-tickets-ecs-task-role",       # External
+])
+```
+
+**Last broken:** 2026-02-04 (UAT staging test, missing `test-tickets-ecs-task-role`)
+
+### 3. Security Group Rules for ALB Access (CRITICAL)
+
+**What breaks:** ALB health checks fail, targets show "unhealthy", 504 Gateway Timeout
+
+**Why it happens:** Containers must allow inbound traffic from the ALB security group. The Terraform-managed rules only allow traffic from the proxy SG. If containers self-register with the ALB (bypassing the proxy), they need direct ALB access.
+
+**Prevention checklist:**
+- [ ] When a container registers directly with the ALB, ensure SG allows ALB inbound
+- [ ] Check both the port the container listens on AND the health check port
+- [ ] The ALB security group is `sg-01e33c097eb569074`
+
+**Required security group rules for containers using dynamic UAT subdomains:**
+```bash
+# Allow ALB to reach container on port 3000 (claude-agent API server)
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0c6486526730186cb \
+  --protocol tcp --port 3000 \
+  --source-group sg-01e33c097eb569074
+
+# Allow ALB to reach container on port 3001 (test-tickets-uat dev server)
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0c6486526730186cb \
+  --protocol tcp --port 3001 \
+  --source-group sg-01e33c097eb569074
+```
+
+**Verify current rules:**
+```bash
+aws ec2 describe-security-groups --group-ids sg-0c6486526730186cb \
+  --query 'SecurityGroups[0].IpPermissions[*].{Port:FromPort,Source:UserIdGroupPairs[0].GroupId}' \
+  --output table --region us-east-1
+```
+
+**Last broken:** 2026-02-04 (UAT test, port 3001 not allowed from ALB)
+
+### 4. Task Definition Container Names
+
+**What breaks:** ECS task launches but container overrides don't apply
+
+**Why it happens:** The `containerOverrides` in `ecs_launcher.py` must match the container name in the task definition exactly.
+
+**Container names by task definition:**
+| Task Definition | Container Name | Used in |
+|-----------------|---------------|---------|
+| `claude-agent` | `claude-agent` | `launch_agent_task()` |
+| `test-tickets-uat` | `test-tickets` | `launch_test_tickets_task()` |
+
+**Prevention:** If you rename a container in a task definition, update `ecs_launcher.py`.
+
+---
+
+## Known Issues
 
 ### VITE_GOOGLE_CLIENT_ID Configuration (Fixed 2026-02-02)
 
