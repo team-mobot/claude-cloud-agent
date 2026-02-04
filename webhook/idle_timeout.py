@@ -147,6 +147,12 @@ def lambda_handler(event: dict, context: Any) -> dict:
     stopped_count = 0
     for session in sessions:
         session_id = session.get("session_id")
+        session_type = session.get("session_type", "")
+
+        # Skip persistent sessions (long-running services that shouldn't be timed out)
+        if session_type == "persistent":
+            logger.info(f"Skipping persistent session {session_id}")
+            continue
 
         # Get last activity time (or fall back to created_at)
         last_activity = session.get("last_activity") or session.get("created_at") or 0
