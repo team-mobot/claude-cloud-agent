@@ -152,32 +152,50 @@ aws ecs run-task \
 
 The Lambda **configuration** (env vars, IAM, timeout, etc.) is managed by Terraform. Only deploy **code changes** manually.
 
-**Deployment directory:** `/Users/dave/git/claude-cloud-agent/version-two/webhook-deploy/`
+**CRITICAL: Lambda requires Linux binaries for native dependencies (cryptography, cffi). You MUST use Docker to build dependencies - NEVER use pip install directly on macOS.**
 
-This directory contains pre-built Linux dependencies (requests, jwt, cryptography, etc.). Never rebuild from scratch on macOS.
+**Deployment directory:** `webhook-deploy/` (in this repo, gitignored)
 
 ```bash
-# 1. Copy updated Python files to deployment directory
-cp /Users/dave/git/claude-cloud-agent/main/webhook/*.py \
-   /Users/dave/git/claude-cloud-agent/version-two/webhook-deploy/
+cd /Users/dave/git/claude-cloud-agent/main
+
+# 1. ALWAYS rebuild dependencies using Docker with Lambda base image
+#    This ensures Linux-compatible binaries for cryptography/cffi
+rm -rf webhook-deploy && mkdir -p webhook-deploy
+docker run --rm --platform linux/amd64 --entrypoint bash \
+  -v $(pwd)/webhook:/webhook \
+  -v $(pwd)/webhook-deploy:/output \
+  public.ecr.aws/lambda/python:3.11 \
+  -c "pip install --target /output requests pyjwt 'cryptography<44' boto3 && cp /webhook/*.py /output/"
 
 # 2. Create deployment zip
-cd /Users/dave/git/claude-cloud-agent/version-two/webhook-deploy
-zip -r ../webhook-lambda-new.zip . -x "*.pyc" -x "__pycache__/*" -x "*.DS_Store"
+cd webhook-deploy
+zip -r ../webhook-lambda.zip . -x "*.pyc" -x "__pycache__/*" -x "*.DS_Store"
+cd ..
 
 # 3. Deploy webhook Lambda
-cd /Users/dave/git/claude-cloud-agent/version-two
 aws lambda update-function-code \
   --function-name claude-cloud-agent-webhook \
-  --zip-file fileb://webhook-lambda-new.zip \
+  --zip-file fileb://webhook-lambda.zip \
   --region us-east-1
 
 # 4. Deploy idle-timeout Lambda (uses same zip - contains idle_timeout.py)
 aws lambda update-function-code \
   --function-name claude-cloud-agent-idle-timeout \
-  --zip-file fileb://webhook-lambda-new.zip \
+  --zip-file fileb://webhook-lambda.zip \
   --region us-east-1
+
+# 5. Test webhook is working
+curl -s -X POST https://webhook.uat.teammobot.dev/webhook \
+  -H "Content-Type: application/json" -H "X-GitHub-Event: ping" -d '{"zen": "test"}'
+# Expected response: {"error": "Invalid signature"}
 ```
+
+**Why Docker is required:**
+- The `cryptography` library has native Rust/C extensions that must be compiled for Linux
+- macOS binaries (*.darwin.so) will fail with "invalid ELF header" on Lambda
+- Even Linux binaries may fail with "GLIBC version not found" if built on wrong distro
+- The `public.ecr.aws/lambda/python:3.11` image matches Lambda's runtime exactly
 
 **Important:** To change Lambda environment variables or configuration, update Terraform in `lambda.tf`, not the AWS console.
 
