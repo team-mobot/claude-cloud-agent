@@ -554,10 +554,10 @@ check_status() {
 cleanup() {
     log_info "Cleaning up old E2E test resources..."
 
-    # Close old E2E PRs
+    # Close old E2E PRs (both direct E2E tests and Claude-generated ones)
     log_info "Closing old E2E test PRs..."
     local old_prs=$(gh pr list --repo "$GITHUB_REPO" --state open --json number,title \
-        --jq '.[] | select(.title | startswith("E2E Test:")) | .number')
+        --jq '.[] | select(.title | (startswith("E2E Test:") or (startswith("[Claude]") and contains("E2E")))) | .number')
 
     for pr in $old_prs; do
         log_info "Closing PR #$pr"
