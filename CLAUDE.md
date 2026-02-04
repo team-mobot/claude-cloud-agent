@@ -601,7 +601,28 @@ The `claude-cloud-agent-idle-timeout` Lambda runs every 10 minutes to stop ECS t
 
 ### Lambda Deployment Notes
 
-The Lambda requires Linux binaries for cryptography. The deployment directory at `/Users/dave/git/claude-cloud-agent/version-two/webhook-deploy/` contains pre-built Linux dependencies. Never rebuild from scratch on macOS - always copy Python files to this directory and create the zip from there.
+The Lambda requires Linux binaries for cryptography. The deployment is now done from `/Users/dave/git/claude-cloud-agent/main/`:
+
+```bash
+# 1. Extract existing zip to preserve Linux dependencies
+cd /Users/dave/git/claude-cloud-agent/main
+mkdir -p webhook-deploy && cd webhook-deploy
+unzip -o ../webhook-lambda.zip
+
+# 2. Copy updated Python files
+cp ../webhook/*.py .
+
+# 3. Create new zip
+zip -r ../webhook-lambda-new.zip . -x "*.pyc" -x "__pycache__/*" -x "*.DS_Store"
+
+# 4. Deploy
+aws lambda update-function-code \
+  --function-name claude-cloud-agent-webhook \
+  --zip-file fileb://webhook-lambda-new.zip \
+  --region us-east-1
+```
+
+Never rebuild from scratch on macOS - always extract the existing zip and update Python files.
 
 ### VITE_GOOGLE_CLIENT_ID Configuration (Fixed 2026-02-02)
 
@@ -798,3 +819,63 @@ In E2E testing, Claude sometimes gets stuck in a loop repeating the same action 
 - Prompt engineering issues
 
 **Workaround:** Stop the ECS task and retry with a simpler, more specific prompt.
+
+### GitHub Issue Agent Not Implementing (Fixed 2026-02-04)
+
+When triggered by a GitHub Issue (vs JIRA), the agent would analyze the issue but not actually implement changes or commit code.
+
+**Root cause:** The initial prompt for GitHub Issues did not include explicit implementation instructions. It was:
+```python
+f"Issue #{issue_number}: {issue_title}\n\n{issue_body}"
+```
+
+But the JIRA prompt explicitly told Claude to implement:
+```python
+f"""JIRA Issue {issue_key}: {issue_summary}
+
+{issue_description}
+
+Implement the requirements described above. When complete, commit and push your changes."""
+```
+
+**Fix:** Updated `webhook/handler.py` to add explicit implementation instructions to GitHub Issue prompts:
+```python
+initial_prompt = f"""GitHub Issue #{issue_number}: {issue_title}
+
+{issue_body}
+
+Implement the requirements described above. When complete, commit and push your changes."""
+```
+
+**Lesson learned:** Claude will respond conversationally unless explicitly instructed to implement. Always include action verbs like "Implement" and "commit and push" in prompts.
+
+**Deployed:** 2026-02-04, Lambda update via `aws lambda update-function-code`
+
+### test-tickets-uat IAM PassRole Permission (Fixed 2026-02-04)
+
+Adding `uat-staging` label to PRs in test_tickets repo failed with:
+```
+AccessDeniedException: User claude-cloud-agent-WebhookLambdaRole is not authorized
+to perform: iam:PassRole on resource: test-tickets-ecs-execution-role
+```
+
+**Root cause:** The webhook Lambda's `ECSPassRole` IAM permission only included the Terraform-managed roles (agent, proxy), not the test-tickets roles. When using `uat-staging` label, the Lambda needs to register a new task definition revision with the staging image, which requires PassRole for the execution role.
+
+**Fix:** Updated `lambda.tf` to add all required roles to PassRole permission:
+```hcl
+Resource = compact([
+  aws_iam_role.agent_execution.arn,
+  aws_iam_role.agent_task.arn,
+  aws_iam_role.proxy_execution.arn,
+  aws_iam_role.proxy_task.arn,
+  # test-tickets-uat roles (conditional)
+  var.test_tickets_image_uri != "" ? aws_iam_role.test_tickets_execution[0].arn : null,
+  var.test_tickets_image_uri != "" ? aws_iam_role.test_tickets_task[0].arn : null,
+  # External test-tickets role
+  "arn:aws:iam::${local.account_id}:role/test-tickets-ecs-execution-role"
+])
+```
+
+**Deployed:** 2026-02-04, Terraform run `run-uoE4bvdzpo1HJbbN`
+
+**Lesson learned:** When launching ECS tasks with custom images (non-:latest), the Lambda needs to register a new task definition, which requires PassRole for ALL execution and task roles the task definition might use.
