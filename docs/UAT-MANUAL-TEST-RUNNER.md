@@ -34,7 +34,7 @@ Optional:
 | --- | --- |
 | `ARTIFACTS_S3_URI` | S3 prefix for logs/screenshots. |
 | `MOBOT_BASE_URL` | Defaults to `https://app.teammobot.dev`. |
-| `CLAUDE_MODEL` | Overrides the Claude Code model. The test_tickets workflow sets this to `global.anthropic.claude-opus-4-7`. |
+| `CLAUDE_MODEL` | Overrides the Claude Code model. The runner also exposes this as `ANTHROPIC_MODEL` and, for Opus models, `ANTHROPIC_DEFAULT_OPUS_MODEL`. The test_tickets workflow sets this to `global.anthropic.claude-opus-4-7`. |
 
 Auth resolution order:
 

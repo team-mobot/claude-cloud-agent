@@ -215,6 +215,10 @@ def run_claude(config: RunnerConfig, plan: dict[str, Any]) -> int:
     env_vars = os.environ.copy()
     env_vars.setdefault("CLAUDE_CODE_USE_BEDROCK", "1")
     env_vars.setdefault("NODE_PATH", "/usr/local/lib/node_modules")
+    if config.claude_model:
+        env_vars.setdefault("ANTHROPIC_MODEL", config.claude_model)
+        if "opus" in config.claude_model:
+            env_vars.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", config.claude_model)
 
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     with CLAUDE_LOG_PATH.open("w", encoding="utf-8") as log_file:
