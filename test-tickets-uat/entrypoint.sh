@@ -476,7 +476,7 @@ else
 fi
 
 echo "[5/8] Setting environment..."
-export NODE_ENV=development
+export NODE_ENV="${NODE_ENV:-development}"
 # Accept RDS SSL certificates (Amazon's CA)
 export NODE_TLS_REJECT_UNAUTHORIZED=0
 export FRONTEND_URL="https://${SESSION_ID:-localhost}.uat.teammobot.dev"
