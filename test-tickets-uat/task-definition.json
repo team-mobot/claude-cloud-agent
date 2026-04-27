@@ -1,0 +1,80 @@
+{
+  "family": "test-tickets-uat",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "taskRoleArn": "arn:aws:iam::678954237808:role/test-tickets-ecs-task-role",
+  "executionRoleArn": "arn:aws:iam::678954237808:role/test-tickets-ecs-execution-role",
+  "containerDefinitions": [
+    {
+      "name": "test-tickets",
+      "image": "678954237808.dkr.ecr.us-east-1.amazonaws.com/test-tickets-uat:latest",
+      "cpu": 0,
+      "portMappings": [
+        {
+          "containerPort": 3001,
+          "hostPort": 3001,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "environment": [
+        {
+          "name": "AWS_REGION",
+          "value": "us-east-1"
+        },
+        {
+          "name": "VPC_ID",
+          "value": "vpc-0fde49947ce39aec4"
+        },
+        {
+          "name": "UAT_DOMAIN_SUFFIX",
+          "value": "uat.teammobot.dev"
+        },
+        {
+          "name": "NODE_ENV",
+          "value": "production"
+        },
+        {
+          "name": "MOBOT_BASE_URL",
+          "value": "https://app.teammobot.dev"
+        },
+        {
+          "name": "ALB_LISTENER_ARN",
+          "value": "arn:aws:elasticloadbalancing:us-east-1:678954237808:listener/app/test-tickets-uat-alb/7e47b6b368ee29e1/9b650b437fde8e6f"
+        },
+        {
+          "name": "SESSIONS_TABLE",
+          "value": "claude-cloud-agent-sessions"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "JWT_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:mobot-agents/staging-5WNH6Y:JWT_SECRET::"
+        },
+        {
+          "name": "MOBOT_JWS_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:mobot-agents/staging-5WNH6Y:MOBOT_JWS_SECRET::"
+        },
+        {
+          "name": "STAGING_DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:mobot-agents/staging-5WNH6Y:DATABASE_URL::"
+        },
+        {
+          "name": "GOOGLE_CLIENT_ID",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:mobot-agents/staging-5WNH6Y:GOOGLE_CLIENT_ID::"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/test-tickets-uat",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "uat"
+        }
+      }
+    }
+  ]
+}

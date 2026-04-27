@@ -1,0 +1,43 @@
+{
+  "family": "claude-playwright-uat-runner",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "4096",
+  "memory": "8192",
+  "taskRoleArn": "arn:aws:iam::678954237808:role/claude-agent-task-role",
+  "executionRoleArn": "arn:aws:iam::678954237808:role/claude-agent-execution-role",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "containerDefinitions": [
+    {
+      "name": "uat-runner",
+      "image": "678954237808.dkr.ecr.us-east-1.amazonaws.com/claude-agent:uat-runner",
+      "essential": true,
+      "environment": [
+        {
+          "name": "RUN_MODE",
+          "value": "uat-playwright"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "us-east-1"
+        },
+        {
+          "name": "CLAUDE_CODE_USE_BEDROCK",
+          "value": "1"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/claude-playwright-uat-runner",
+          "awslogs-create-group": "true",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "uat-runner"
+        }
+      }
+    }
+  ]
+}

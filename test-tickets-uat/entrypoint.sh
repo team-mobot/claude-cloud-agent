@@ -243,7 +243,7 @@ except Exception as e:
         2>/dev/null && echo "  Updated DynamoDB session" || echo "  Warning: Could not update DynamoDB"
 
     # Post "UAT Environment Started" comment to GitHub
-    if [ -n "$GITHUB_TOKEN" ] && [ -n "$REPO" ] && [ -n "$PR_NUMBER" ]; then
+    if [ "${SUPPRESS_GITHUB_COMMENTS:-false}" != "true" ] && [ -n "$GITHUB_TOKEN" ] && [ -n "$REPO" ] && [ -n "$PR_NUMBER" ]; then
         UAT_URL="https://${SESSION_ID}.${UAT_DOMAIN_SUFFIX:-uat.teammobot.dev}"
 
         # Check session details from DynamoDB (initial_prompt, source, jira_issue_key)

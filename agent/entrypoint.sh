@@ -5,6 +5,13 @@ echo "=== Claude Cloud Agent Starting ==="
 echo "Session ID: ${SESSION_ID}"
 echo "Repository: ${REPO_CLONE_URL}"
 echo "Branch: ${BRANCH_NAME}"
+echo "Run mode: ${RUN_MODE:-agent}"
+
+if [ "${RUN_MODE:-agent}" = "uat-playwright" ]; then
+    echo "Starting UAT Playwright runner..."
+    cd /app
+    exec python uat_runner.py
+fi
 
 # Configure git
 git config --global user.name "Claude Agent"
