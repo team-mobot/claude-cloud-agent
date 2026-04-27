@@ -20,9 +20,20 @@ git config user.name "Claude Dev Agent"
 
 if [ -n "$GITHUB_TOKEN" ]; then
     echo "  Configuring GitHub token for private Git dependencies..."
-    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
-    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "git@github.com:"
-    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+    GITHUB_AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/"
+    git config --global url."${GITHUB_AUTH_URL}".insteadOf "ssh://git@github.com/"
+    git config --global --add url."${GITHUB_AUTH_URL}".insteadOf "ssh://git@github.com"
+    git config --global --add url."${GITHUB_AUTH_URL}".insteadOf "git@github.com:"
+    git config --global --add url."${GITHUB_AUTH_URL}".insteadOf "https://github.com/"
+    export GIT_CONFIG_COUNT=4
+    export GIT_CONFIG_KEY_0="url.${GITHUB_AUTH_URL}.insteadOf"
+    export GIT_CONFIG_VALUE_0="ssh://git@github.com/"
+    export GIT_CONFIG_KEY_1="url.${GITHUB_AUTH_URL}.insteadOf"
+    export GIT_CONFIG_VALUE_1="ssh://git@github.com"
+    export GIT_CONFIG_KEY_2="url.${GITHUB_AUTH_URL}.insteadOf"
+    export GIT_CONFIG_VALUE_2="git@github.com:"
+    export GIT_CONFIG_KEY_3="url.${GITHUB_AUTH_URL}.insteadOf"
+    export GIT_CONFIG_VALUE_3="https://github.com/"
 fi
 
 # Create a vite wrapper script that patches config before each run
