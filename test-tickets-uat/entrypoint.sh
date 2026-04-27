@@ -5,9 +5,87 @@ echo "=== test_tickets UAT Container Starting ==="
 echo "  Branch: ${BRANCH:-main}"
 echo "  Session: ${SESSION_ID:-unknown}"
 
+resolve_github_token() {
+    if [ -n "$GITHUB_TOKEN" ]; then
+        return
+    fi
+
+    if [ -z "$GITHUB_APP_ID" ] || [ -z "$GITHUB_APP_PRIVATE_KEY" ]; then
+        echo "  Warning: no GitHub token or GitHub App credentials configured"
+        return
+    fi
+
+    echo "  Minting GitHub App installation token..."
+    GITHUB_TOKEN=$(node <<'NODE'
+const crypto = require('crypto');
+
+function base64url(value) {
+  return Buffer.from(value).toString('base64url');
+}
+
+async function main() {
+  const appId = process.env.GITHUB_APP_ID;
+  const privateKey = process.env.GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n');
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const payload = base64url(JSON.stringify({
+    iat: now - 60,
+    exp: now + 600,
+    iss: appId,
+  }));
+  const signingInput = `${header}.${payload}`;
+  const signer = crypto.createSign('RSA-SHA256');
+  signer.update(signingInput);
+  signer.end();
+  const jwt = `${signingInput}.${signer.sign(privateKey).toString('base64url')}`;
+
+  async function github(path, options = {}) {
+    const response = await fetch(`https://api.github.com${path}`, {
+      method: options.method || 'GET',
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`${response.status} ${await response.text()}`);
+    }
+    return response.json();
+  }
+
+  let installationId = process.env.GITHUB_APP_INSTALLATION_ID || process.env.GITHUB_INSTALLATION_ID;
+  if (!installationId) {
+    const repo = process.env.REPO || 'team-mobot/test_tickets';
+    const installation = await github(`/repos/${repo}/installation`);
+    installationId = installation.id;
+  }
+
+  const token = await github(`/app/installations/${installationId}/access_tokens`, { method: 'POST' });
+  if (!token.token) {
+    throw new Error('GitHub did not return an installation token');
+  }
+  process.stdout.write(token.token);
+}
+
+main().catch((error) => {
+  console.error(`Failed to mint GitHub App installation token: ${error.message}`);
+  process.exit(1);
+});
+NODE
+)
+    export GITHUB_TOKEN
+}
+
+resolve_github_token
+
 # Clone repository
 echo "[1/8] Cloning repository..."
-REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO:-team-mobot/test_tickets}.git"
+if [ -n "$GITHUB_TOKEN" ]; then
+    REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO:-team-mobot/test_tickets}.git"
+else
+    REPO_URL="https://github.com/${REPO:-team-mobot/test_tickets}.git"
+fi
 git clone --depth 1 --branch "${BRANCH:-main}" "$REPO_URL" /app/repo 2>&1 || {
     echo "Failed to clone branch ${BRANCH}, trying main..."
     git clone --depth 1 --branch main "$REPO_URL" /app/repo
