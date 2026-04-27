@@ -18,6 +18,13 @@ cd /app/repo
 git config user.email "claude-dev@teammobot.dev"
 git config user.name "Claude Dev Agent"
 
+if [ -n "$GITHUB_TOKEN" ]; then
+    echo "  Configuring GitHub token for private Git dependencies..."
+    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "git@github.com:"
+    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+fi
+
 # Create a vite wrapper script that patches config before each run
 echo "  Creating Vite wrapper script..."
 cat > /app/vite-wrapper.js << 'VITE_WRAPPER'
