@@ -29,10 +29,13 @@ class RunnerConfig:
     artifacts_s3_uri: str
     mobot_base_url: str
     mobot_api_key_secret_id: str
+    pr_number: str = ""
     mobot_auth_header: str = ""
     mobot_auth_token: str = ""
     test_plan_s3_uri: str = ""
     test_plan_json: str = ""
+    runner_prompt_s3_uri: str = ""
+    runner_prompt: str = ""
     claude_model: str = ""
 
 
@@ -55,10 +58,13 @@ def load_config() -> RunnerConfig:
         artifacts_s3_uri=env("ARTIFACTS_S3_URI"),
         mobot_base_url=env("MOBOT_BASE_URL", "https://app.teammobot.dev").rstrip("/"),
         mobot_api_key_secret_id=env("MOBOT_API_KEY_SECRET_ID"),
+        pr_number=env("PR_NUMBER"),
         mobot_auth_header=env("MOBOT_AUTH_HEADER"),
         mobot_auth_token=env("MOBOT_AUTH_TOKEN"),
         test_plan_s3_uri=env("TEST_PLAN_S3_URI"),
         test_plan_json=env("TEST_PLAN_JSON"),
+        runner_prompt_s3_uri=env("RUNNER_PROMPT_S3_URI"),
+        runner_prompt=env("RUNNER_PROMPT"),
         claude_model=env("CLAUDE_MODEL"),
     )
 
@@ -78,6 +84,12 @@ def download_json(uri: str) -> dict[str, Any]:
     bucket, key = parse_s3_uri(uri)
     response = s3_client().get_object(Bucket=bucket, Key=key)
     return json.loads(response["Body"].read().decode("utf-8"))
+
+
+def download_text(uri: str) -> str:
+    bucket, key = parse_s3_uri(uri)
+    response = s3_client().get_object(Bucket=bucket, Key=key)
+    return response["Body"].read().decode("utf-8")
 
 
 def upload_file(path: Path, uri: str) -> None:
@@ -104,6 +116,14 @@ def load_test_plan(config: RunnerConfig) -> dict[str, Any]:
     if config.test_plan_s3_uri:
         return download_json(config.test_plan_s3_uri)
     raise RuntimeError("Set TEST_PLAN_JSON or TEST_PLAN_S3_URI")
+
+
+def load_runner_prompt(config: RunnerConfig) -> str:
+    if config.runner_prompt:
+        return config.runner_prompt
+    if config.runner_prompt_s3_uri:
+        return download_text(config.runner_prompt_s3_uri)
+    raise RuntimeError("Set RUNNER_PROMPT or RUNNER_PROMPT_S3_URI")
 
 
 def get_mobot_api_key(config: RunnerConfig) -> str:
@@ -269,63 +289,25 @@ def handle_claude_stream_line(line: str) -> None:
         append_progress(f"Claude system: {event['subtype']}", {"source": "system"})
 
 
-def build_prompt(config: RunnerConfig, plan: dict[str, Any]) -> str:
-    return f"""
-You are running one-shot UAT for a GitHub pull request.
-
-Target URL: {config.target_url}
-Session ID: {config.session_id}
-Mobot base URL: {config.mobot_base_url}
-
-Use Playwright Chromium to execute the test plan below against the target URL.
-You may create helper scripts inside {WORK_DIR}.
-Do not modify the application source code or commit anything.
-
-Execution style:
-- Prefer lightweight, incremental Playwright automation over building a broad reusable test harness.
-- Start executing the first test case as soon as authentication and basic page loading are confirmed.
-- It is fine to create small one-off scripts or a tiny shared helper for login/cookies/screenshots, but do not spend time scaffolding a framework unless a case genuinely requires it.
-- Execute cases one at a time or in small related groups so progress and blockers are visible throughout the run.
-
-Authentication:
-- The environment variable MOBOT_AUTH_HEADER is already a complete HTTP Authorization header value.
-- For direct API calls, send exactly: Authorization: $MOBOT_AUTH_HEADER. Do not prepend Bearer, Token, Cookie, or any other prefix.
-- If you need browser auth in Playwright and MOBOT_AUTH_HEADER starts with "Token ", strip only that prefix and set a secure cookie named "token" on the target URL host before navigating.
-- Never print the real token or auth header in progress lines, logs, screenshots, or results. Use "<redacted>" when describing auth.
-- If browser login is blocked by an interactive Google OAuth flow, mark the affected case blocked and explain the blocker.
-
-Evidence:
-- Save useful screenshots, traces, or logs under {ARTIFACT_DIR}.
-- Keep evidence names short and stable.
-
-Progress logging:
-- As you work, emit concise text progress lines.
-- When starting a test case, emit: UAT_PROGRESS TC-001 START short title.
-- When finishing a test case, emit: UAT_PROGRESS TC-001 PASS|FAIL|BLOCKED short reason.
-- If a shared blocker prevents multiple cases, emit one progress line for each affected case before writing results.
-
-When done, write strict JSON to {RESULTS_PATH} with this exact shape:
-{{
-  "status": "passed|failed|blocked|error",
-  "summary": "one sentence summary",
-  "targetUrl": "{config.target_url}",
-  "cases": [
-    {{
-      "id": "TC-001",
-      "title": "case title",
-      "status": "pass|fail|blocked",
-      "notes": "what happened and why",
-      "evidence": ["relative/path/from/artifacts"]
-    }}
-  ]
-}}
-
-Test plan JSON:
-{json.dumps(plan, indent=2)}
-""".strip()
+def render_prompt_template(template: str, config: RunnerConfig, plan: dict[str, Any]) -> str:
+    replacements = {
+        "targetUrl": config.target_url,
+        "sessionId": config.session_id,
+        "mobotBaseUrl": config.mobot_base_url,
+        "prNumber": config.pr_number,
+        "workDir": str(WORK_DIR),
+        "artifactDir": str(ARTIFACT_DIR),
+        "resultsPath": str(RESULTS_PATH),
+        "testPlanJson": json.dumps(plan, indent=2),
+    }
+    rendered = template
+    for key, value in replacements.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", value)
+        rendered = rendered.replace(f"{{{{ {key} }}}}", value)
+    return rendered.strip()
 
 
-def run_claude(config: RunnerConfig, plan: dict[str, Any]) -> int:
+def run_claude(config: RunnerConfig, plan: dict[str, Any], runner_prompt: str) -> int:
     command = [
         "claude",
         "--dangerously-skip-permissions",
@@ -335,7 +317,7 @@ def run_claude(config: RunnerConfig, plan: dict[str, Any]) -> int:
     ]
     if config.claude_model:
         command.extend(["--model", config.claude_model])
-    command.extend(["-p", build_prompt(config, plan)])
+    command.extend(["-p", render_prompt_template(runner_prompt, config, plan)])
 
     env_vars = os.environ.copy()
     env_vars.setdefault("CLAUDE_CODE_USE_BEDROCK", "1")
@@ -378,6 +360,12 @@ def normalize_status(status: Any) -> str:
     return "blocked"
 
 
+def fallback_case_id(config: RunnerConfig, index: int) -> str:
+    if config.pr_number:
+        return f"TC{config.pr_number}-{index + 1:02d}"
+    return f"TC-{index + 1:03d}"
+
+
 def normalize_results(config: RunnerConfig, plan: dict[str, Any]) -> dict[str, Any]:
     if not RESULTS_PATH.exists():
         return fallback_results(config, plan, "Claude did not write results.json")
@@ -395,7 +383,7 @@ def normalize_results(config: RunnerConfig, plan: dict[str, Any]) -> dict[str, A
     for index, test_case in enumerate(cases):
         normalized_cases.append(
             {
-                "id": str(test_case.get("id") or f"TC-{index + 1:03d}"),
+                "id": str(test_case.get("id") or fallback_case_id(config, index)),
                 "title": str(test_case.get("title") or f"Test case {index + 1}"),
                 "status": normalize_status(test_case.get("status")),
                 "notes": str(test_case.get("notes") or test_case.get("error") or ""),
@@ -426,7 +414,7 @@ def fallback_results(config: RunnerConfig, plan: dict[str, Any], reason: str) ->
     plan_cases = plan.get("testCases") if isinstance(plan.get("testCases"), list) else []
     cases = [
         {
-            "id": str(test_case.get("id") or f"TC-{index + 1:03d}"),
+            "id": str(test_case.get("id") or fallback_case_id(config, index)),
             "title": str(test_case.get("title") or f"Test case {index + 1}"),
             "status": "blocked",
             "notes": reason,
@@ -454,6 +442,7 @@ def main() -> int:
 
     config = load_config()
     plan = load_test_plan(config)
+    runner_prompt = load_runner_prompt(config)
     write_json(PLAN_PATH, plan)
 
     try:
@@ -462,7 +451,7 @@ def main() -> int:
         if auth_header.startswith("Token "):
             os.environ["MOBOT_AUTH_TOKEN"] = auth_header.removeprefix("Token ")
 
-        claude_exit_code = run_claude(config, plan)
+        claude_exit_code = run_claude(config, plan, runner_prompt)
         results = normalize_results(config, plan)
         if claude_exit_code != 0 and results.get("status") == "passed":
             results["status"] = "error"
