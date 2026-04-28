@@ -281,6 +281,12 @@ Use Playwright Chromium to execute the test plan below against the target URL.
 You may create helper scripts inside {WORK_DIR}.
 Do not modify the application source code or commit anything.
 
+Execution style:
+- Prefer lightweight, incremental Playwright automation over building a broad reusable test harness.
+- Start executing the first test case as soon as authentication and basic page loading are confirmed.
+- It is fine to create small one-off scripts or a tiny shared helper for login/cookies/screenshots, but do not spend time scaffolding a framework unless a case genuinely requires it.
+- Execute cases one at a time or in small related groups so progress and blockers are visible throughout the run.
+
 Authentication:
 - The environment variable MOBOT_AUTH_HEADER is already a complete HTTP Authorization header value.
 - For direct API calls, send exactly: Authorization: $MOBOT_AUTH_HEADER. Do not prepend Bearer, Token, Cookie, or any other prefix.
