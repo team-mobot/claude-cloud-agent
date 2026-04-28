@@ -10,9 +10,12 @@ RUN apt-get update && apt-get install -y \
     npm \
     && rm -rf /var/lib/apt/lists/*
 
+ENV PLAYWRIGHT_BROWSERS_PATH="/ms-playwright"
+
 # Install Claude Code CLI and Playwright tooling for one-shot UAT runner tasks.
 RUN npm install -g @anthropic-ai/claude-code playwright @playwright/test @playwright/cli && \
-    npx playwright install --with-deps chromium
+    npx playwright install --with-deps chromium && \
+    chmod -R a+rX /ms-playwright
 
 # Create non-root user for running Claude Code
 # (Claude Code refuses --dangerously-skip-permissions when running as root)
