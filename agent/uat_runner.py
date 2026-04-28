@@ -290,8 +290,11 @@ def handle_claude_stream_line(line: str) -> None:
 
 
 def render_prompt_template(template: str, config: RunnerConfig, plan: dict[str, Any]) -> str:
+    target = urlparse(config.target_url)
     replacements = {
         "targetUrl": config.target_url,
+        "targetOrigin": f"{target.scheme}://{target.netloc}",
+        "targetHost": target.hostname or target.netloc,
         "sessionId": config.session_id,
         "mobotBaseUrl": config.mobot_base_url,
         "prNumber": config.pr_number,

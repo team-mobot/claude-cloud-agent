@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI and Playwright tooling for one-shot UAT runner tasks.
-RUN npm install -g @anthropic-ai/claude-code playwright @playwright/test && \
+RUN npm install -g @anthropic-ai/claude-code playwright @playwright/test @playwright/cli && \
     npx playwright install --with-deps chromium
 
 # Create non-root user for running Claude Code
