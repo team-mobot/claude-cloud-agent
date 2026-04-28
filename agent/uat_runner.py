@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ ARTIFACT_DIR = WORK_DIR / "artifacts"
 RESULTS_PATH = WORK_DIR / "results.json"
 PLAN_PATH = WORK_DIR / "test-plan.json"
 CLAUDE_LOG_PATH = ARTIFACT_DIR / "claude-output.log"
+PROGRESS_PATH = ARTIFACT_DIR / "progress.jsonl"
 
 
 @dataclass(frozen=True)
@@ -159,6 +161,63 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(f"{json.dumps(value, indent=2)}\n", encoding="utf-8")
 
 
+def append_progress(message: str, payload: dict[str, Any] | None = None) -> None:
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    event = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "message": message,
+        **(payload or {}),
+    }
+    with PROGRESS_PATH.open("a", encoding="utf-8") as progress_file:
+        progress_file.write(f"{json.dumps(event, separators=(',', ':'))}\n")
+    print(f"UAT progress: {message}", flush=True)
+
+
+def compact_text(value: str, max_length: int = 240) -> str:
+    text = " ".join(value.split())
+    if len(text) <= max_length:
+        return text
+    return f"{text[:max_length].rstrip()}..."
+
+
+def emit_text_progress(text: str) -> None:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("UAT_PROGRESS"):
+            append_progress(line)
+            continue
+        if len(line) >= 24:
+            append_progress(compact_text(line), {"source": "assistant"})
+            return
+
+
+def handle_claude_stream_line(line: str) -> None:
+    stripped = line.strip()
+    if not stripped:
+        return
+    try:
+        event = json.loads(stripped)
+    except json.JSONDecodeError:
+        append_progress(compact_text(stripped), {"source": "claude"})
+        return
+
+    event_type = event.get("type")
+    if event_type == "assistant":
+        for item in event.get("message", {}).get("content", []):
+            item_type = item.get("type")
+            if item_type == "text":
+                emit_text_progress(str(item.get("text") or ""))
+            elif item_type == "tool_use":
+                append_progress(f"tool {item.get('name') or 'unknown'}", {"source": "tool_use"})
+    elif event_type == "result":
+        status = event.get("subtype") or event.get("result") or "completed"
+        append_progress(f"Claude result: {status}", {"source": "result"})
+    elif event_type == "system" and event.get("subtype"):
+        append_progress(f"Claude system: {event['subtype']}", {"source": "system"})
+
+
 def build_prompt(config: RunnerConfig, plan: dict[str, Any]) -> str:
     return f"""
 You are running one-shot UAT for a GitHub pull request.
@@ -178,6 +237,12 @@ Authentication:
 Evidence:
 - Save useful screenshots, traces, or logs under {ARTIFACT_DIR}.
 - Keep evidence names short and stable.
+
+Progress logging:
+- As you work, emit concise text progress lines.
+- When starting a test case, emit: UAT_PROGRESS TC-001 START short title.
+- When finishing a test case, emit: UAT_PROGRESS TC-001 PASS|FAIL|BLOCKED short reason.
+- If a shared blocker prevents multiple cases, emit one progress line for each affected case before writing results.
 
 When done, write strict JSON to {RESULTS_PATH} with this exact shape:
 {{
@@ -221,17 +286,25 @@ def run_claude(config: RunnerConfig, plan: dict[str, Any]) -> int:
             env_vars.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", config.claude_model)
 
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    append_progress("starting Claude Code")
     with CLAUDE_LOG_PATH.open("w", encoding="utf-8") as log_file:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=str(WORK_DIR),
             env=env_vars,
-            stdout=log_file,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            check=False,
+            bufsize=1,
         )
-    return completed.returncode
+        if process.stdout:
+            for line in process.stdout:
+                log_file.write(line)
+                log_file.flush()
+                handle_claude_stream_line(line)
+        return_code = process.wait()
+    append_progress(f"Claude Code exited with code {return_code}")
+    return return_code
 
 
 def normalize_status(status: Any) -> str:

@@ -79,8 +79,68 @@ NODE
 
 resolve_github_token
 
+authenticated_github_url() {
+    local repo="$1"
+    if [ -n "$GITHUB_TOKEN" ]; then
+        echo "https://x-access-token:${GITHUB_TOKEN}@github.com/${repo}.git"
+    else
+        echo "https://github.com/${repo}.git"
+    fi
+}
+
+disable_git_push() {
+    local repo_path="$1"
+    mkdir -p "${repo_path}/.git/hooks"
+    cat > "${repo_path}/.git/hooks/pre-push" <<'PRE_PUSH_EOF'
+#!/bin/sh
+echo "Pushes are disabled in the UAT native-git clone." >&2
+exit 1
+PRE_PUSH_EOF
+    chmod +x "${repo_path}/.git/hooks/pre-push"
+    git -C "$repo_path" remote set-url --push origin DISABLED
+}
+
+clone_native_git_repo() {
+    local repo="$1"
+    local destination="$2"
+    local branch="${3:-main}"
+    local public_url="https://github.com/${repo}.git"
+
+    mkdir -p "$(dirname "$destination")"
+    if [ -d "${destination}/.git" ]; then
+        echo "  Native git repo already exists: ${destination}"
+    else
+        if [ -e "$destination" ]; then
+            rm -rf "$destination"
+        fi
+        echo "  Cloning ${repo} -> ${destination}"
+        git clone --branch "$branch" --single-branch "$(authenticated_github_url "$repo")" "$destination"
+    fi
+
+    git -C "$destination" config user.email "claude-dev@teammobot.dev"
+    git -C "$destination" config user.name "Claude UAT Agent"
+    git -C "$destination" remote set-url origin "$public_url"
+    disable_git_push "$destination"
+    git config --global --add safe.directory "$destination"
+}
+
+clear_github_token_git_rewrites() {
+    if [ -n "$GITHUB_AUTH_URL" ]; then
+        git config --global --unset-all "url.${GITHUB_AUTH_URL}.insteadOf" 2>/dev/null || true
+    fi
+    unset GIT_CONFIG_COUNT
+    unset GIT_CONFIG_KEY_0
+    unset GIT_CONFIG_VALUE_0
+    unset GIT_CONFIG_KEY_1
+    unset GIT_CONFIG_VALUE_1
+    unset GIT_CONFIG_KEY_2
+    unset GIT_CONFIG_VALUE_2
+    unset GIT_CONFIG_KEY_3
+    unset GIT_CONFIG_VALUE_3
+}
+
 # Clone repository
-echo "[1/8] Cloning repository..."
+echo "[1/9] Cloning repository..."
 if [ -n "$GITHUB_TOKEN" ]; then
     REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO:-team-mobot/test_tickets}.git"
 else
@@ -159,7 +219,7 @@ if (pkg.scripts && pkg.scripts.dev === 'vite') {
 }
 "
 
-echo "[2/8] Installing dependencies..."
+echo "[2/9] Installing dependencies..."
 npm ci --include=dev 2>&1
 
 # Install server dependencies if separate package
@@ -170,11 +230,23 @@ if [ -f "server/package.json" ]; then
     cd ..
 fi
 
+echo "[3/9] Preparing native Git repositories..."
+export USE_NATIVE_GIT="${USE_NATIVE_GIT:-true}"
+export TEST_PLANS_GIT_REPO_PATH="${TEST_PLANS_GIT_REPO_PATH:-${GIT_REPO_PATH:-/data/repos/ai_driver_test_plans}}"
+export CUSTOMER_DOCS_GIT_REPO_PATH="${CUSTOMER_DOCS_GIT_REPO_PATH:-/data/repos/customer-docs}"
+export TEST_PLANS_GIT_REMOTE_SYNC_ENABLED="${TEST_PLANS_GIT_REMOTE_SYNC_ENABLED:-false}"
+export CUSTOMER_DOCS_GIT_REMOTE_SYNC_ENABLED="${CUSTOMER_DOCS_GIT_REMOTE_SYNC_ENABLED:-false}"
+export GIT_REMOTE_SYNC_ENABLED="${GIT_REMOTE_SYNC_ENABLED:-false}"
+export CUSTOMER_DOCS_MEDIA_LOCAL_ROOT_PATH="${CUSTOMER_DOCS_MEDIA_LOCAL_ROOT_PATH:-/data/customer-docs-media}"
+clone_native_git_repo "${TEST_PLANS_GIT_REPO:-team-mobot/ai_driver_test_plans}" "$TEST_PLANS_GIT_REPO_PATH" "${TEST_PLANS_GIT_REMOTE_BRANCH:-main}"
+clone_native_git_repo "${CUSTOMER_DOCS_GIT_REPO:-team-mobot/customer-docs}" "$CUSTOMER_DOCS_GIT_REPO_PATH" "${CUSTOMER_DOCS_GIT_REMOTE_BRANCH:-main}"
+clear_github_token_git_rewrites
+
 # Set Vite env vars
 export VITE_GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}"
 export VITE_API_URL=""
 
-echo "[3/8] Starting Vite dev server..."
+echo "[4/9] Starting Vite dev server..."
 # Start Vite using our wrapper (which patches allowedHosts before each run)
 # This handles both initial start and any restarts by Claude agent
 npm run dev -- --host 0.0.0.0 --port 5173 &
@@ -192,7 +264,7 @@ for i in $(seq 1 30); do
 done
 
 # Register with DynamoDB and ALB target group
-echo "[4/8] Registering container..."
+echo "[5/9] Registering container..."
 if [ -n "$SESSIONS_TABLE" ] && [ -n "$SESSION_ID" ]; then
     # Get container's IPs from ECS metadata
     TASK_METADATA=$(curl -s "${ECS_CONTAINER_METADATA_URI_V4}/task" 2>/dev/null || echo "{}")
@@ -475,7 +547,7 @@ else
     echo "  Warning: SESSIONS_TABLE or SESSION_ID not set, skipping registration"
 fi
 
-echo "[5/8] Setting environment..."
+echo "[6/9] Setting environment..."
 export NODE_ENV="${NODE_ENV:-development}"
 # Accept RDS SSL certificates (Amazon's CA)
 export NODE_TLS_REJECT_UNAUTHORIZED=0
@@ -484,18 +556,21 @@ export MOBOT_BASE_URL="${MOBOT_BASE_URL:-https://app.teammobot.dev}"
 export WORK_DIR="/app/repo"
 export VITE_DEV_SERVER="http://localhost:5173"
 echo "  NODE_ENV: $NODE_ENV"
+echo "  USE_NATIVE_GIT: $USE_NATIVE_GIT"
+echo "  TEST_PLANS_GIT_REPO_PATH: $TEST_PLANS_GIT_REPO_PATH"
+echo "  CUSTOMER_DOCS_GIT_REPO_PATH: $CUSTOMER_DOCS_GIT_REPO_PATH"
 
-echo "[6/8] Starting prompt server..."
+echo "[7/9] Starting prompt server..."
 echo "  Prompt API on port 8080"
 node /app/prompt-server.js &
 PROMPT_SERVER_PID=$!
 
-echo "[7/8] Starting dev proxy..."
+echo "[8/9] Starting dev proxy..."
 echo "  Proxy on port 3001 -> API (3002) + Vite (5173)"
 PROXY_PORT=3001 VITE_PORT=5173 EXPRESS_PORT=3002 node /app/dev-proxy.js &
 PROXY_PID=$!
 
-echo "[8/8] Starting Express server..."
+echo "[9/9] Starting Express server..."
 echo "  FRONTEND_URL: $FRONTEND_URL"
 echo "  MOBOT_BASE_URL: $MOBOT_BASE_URL"
 echo "  Express API on port 3002"

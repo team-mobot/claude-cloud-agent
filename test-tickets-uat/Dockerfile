@@ -16,8 +16,9 @@ RUN npm install -g tsx
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
-# Use existing node user (uid 1000) and create workspace
-RUN mkdir -p /app && chown -R node:node /app
+# Use existing node user (uid 1000) and create workspace/native git repo roots
+RUN mkdir -p /app /data/repos /data/customer-docs-media && \
+    chown -R node:node /app /data
 
 WORKDIR /app
 

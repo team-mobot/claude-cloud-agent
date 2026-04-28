@@ -47,6 +47,30 @@
         {
           "name": "SESSIONS_TABLE",
           "value": "claude-cloud-agent-sessions"
+        },
+        {
+          "name": "USE_NATIVE_GIT",
+          "value": "true"
+        },
+        {
+          "name": "TEST_PLANS_GIT_REPO_PATH",
+          "value": "/data/repos/ai_driver_test_plans"
+        },
+        {
+          "name": "CUSTOMER_DOCS_GIT_REPO_PATH",
+          "value": "/data/repos/customer-docs"
+        },
+        {
+          "name": "TEST_PLANS_GIT_REMOTE_SYNC_ENABLED",
+          "value": "false"
+        },
+        {
+          "name": "CUSTOMER_DOCS_GIT_REMOTE_SYNC_ENABLED",
+          "value": "false"
+        },
+        {
+          "name": "CUSTOMER_DOCS_MEDIA_LOCAL_ROOT_PATH",
+          "value": "/data/customer-docs-media"
         }
       ],
       "secrets": [
@@ -63,8 +87,28 @@
           "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:mobot-agents/staging-5WNH6Y:DATABASE_URL::"
         },
         {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:mobot-agents/staging-5WNH6Y:DATABASE_URL::"
+        },
+        {
+          "name": "ANALYTICS_DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:mobot-agents/staging-5WNH6Y:ANALYTICS_DATABASE_URL::"
+        },
+        {
           "name": "GOOGLE_CLIENT_ID",
           "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:mobot-agents/staging-5WNH6Y:GOOGLE_CLIENT_ID::"
+        },
+        {
+          "name": "GITHUB_APP_ID",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:claude-dev/github-app-704JPc:app_id::"
+        },
+        {
+          "name": "GITHUB_APP_PRIVATE_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:claude-dev/github-app-704JPc:private_key::"
+        },
+        {
+          "name": "GITHUB_APP_INSTALLATION_ID",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:678954237808:secret:claude-dev/github-app-704JPc:default_installation_id::"
         }
       ],
       "logConfiguration": {
