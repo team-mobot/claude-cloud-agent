@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -180,6 +181,56 @@ def compact_text(value: str, max_length: int = 240) -> str:
     return f"{text[:max_length].rstrip()}..."
 
 
+def redact_progress_text(value: str) -> str:
+    text = re.sub(
+        r"(?i)(authorization|password|secret|token|api[_-]?key)(\s*[:=]\s*)([^\s'\";]+)",
+        r"\1\2[redacted]",
+        value,
+    )
+    return re.sub(r"(?i)(bearer|token)\s+[a-z0-9._~+/=-]{12,}", r"\1 [redacted]", text)
+
+
+def summarize_tool_use(item: dict[str, Any]) -> str:
+    name = str(item.get("name") or "unknown")
+    tool_input = item.get("input")
+    if not isinstance(tool_input, dict):
+        return f"tool {name}"
+
+    if name == "TodoWrite":
+        todos = tool_input.get("todos")
+        if isinstance(todos, list):
+            in_progress = [
+                str(todo.get("content") or "").strip()
+                for todo in todos
+                if isinstance(todo, dict) and todo.get("status") == "in_progress"
+            ]
+            if in_progress:
+                return f"todo: {compact_text(in_progress[0], 180)}"
+            pending_count = sum(
+                1
+                for todo in todos
+                if isinstance(todo, dict) and todo.get("status") == "pending"
+            )
+            completed_count = sum(
+                1
+                for todo in todos
+                if isinstance(todo, dict) and todo.get("status") == "completed"
+            )
+            return f"todo update: {completed_count} completed, {pending_count} pending"
+
+    for key in ("description", "query", "path", "file_path"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return f"tool {name}: {compact_text(redact_progress_text(value), 180)}"
+
+    command = tool_input.get("command")
+    if isinstance(command, str) and command.strip():
+        first_line = next((line.strip() for line in command.splitlines() if line.strip()), "")
+        return f"tool {name}: {compact_text(redact_progress_text(first_line), 180)}"
+
+    return f"tool {name}"
+
+
 def emit_text_progress(text: str) -> None:
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -210,7 +261,7 @@ def handle_claude_stream_line(line: str) -> None:
             if item_type == "text":
                 emit_text_progress(str(item.get("text") or ""))
             elif item_type == "tool_use":
-                append_progress(f"tool {item.get('name') or 'unknown'}", {"source": "tool_use"})
+                append_progress(summarize_tool_use(item), {"source": "tool_use"})
     elif event_type == "result":
         status = event.get("subtype") or event.get("result") or "completed"
         append_progress(f"Claude result: {status}", {"source": "result"})
