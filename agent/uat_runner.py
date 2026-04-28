@@ -282,7 +282,10 @@ You may create helper scripts inside {WORK_DIR}.
 Do not modify the application source code or commit anything.
 
 Authentication:
-- If you need to call Mobot APIs directly, use the environment variable MOBOT_AUTH_HEADER.
+- The environment variable MOBOT_AUTH_HEADER is already a complete HTTP Authorization header value.
+- For direct API calls, send exactly: Authorization: $MOBOT_AUTH_HEADER. Do not prepend Bearer, Token, Cookie, or any other prefix.
+- If you need browser auth in Playwright and MOBOT_AUTH_HEADER starts with "Token ", strip only that prefix and set a secure cookie named "token" on the target URL host before navigating.
+- Never print the real token or auth header in progress lines, logs, screenshots, or results. Use "<redacted>" when describing auth.
 - If browser login is blocked by an interactive Google OAuth flow, mark the affected case blocked and explain the blocker.
 
 Evidence:
