@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import re
@@ -17,6 +18,7 @@ WORK_DIR = Path(os.environ.get("UAT_WORK_DIR", "/workspace/uat-runner"))
 ARTIFACT_DIR = WORK_DIR / "artifacts"
 RESULTS_PATH = WORK_DIR / "results.json"
 PLAN_PATH = WORK_DIR / "test-plan.json"
+PLAYWRIGHT_CONFIG_PATH = WORK_DIR / ".playwright" / "cli.config.json"
 CLAUDE_LOG_PATH = ARTIFACT_DIR / "claude-output.log"
 PROGRESS_PATH = ARTIFACT_DIR / "progress.jsonl"
 
@@ -169,10 +171,42 @@ def exchange_api_key(config: RunnerConfig) -> str:
     return str(token)
 
 
+def jwt_payload(token: str) -> dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(f"{payload}{padding}")
+        value = json.loads(decoded.decode("utf-8"))
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def token_is_expired(token: str) -> bool:
+    exp = jwt_payload(token).get("exp")
+    if not isinstance(exp, (int, float)):
+        return False
+    return exp <= time.time() + 60
+
+
+def has_api_key_auth(config: RunnerConfig) -> bool:
+    return bool(env("MOBOT_API_KEY") or config.mobot_api_key_secret_id)
+
+
 def resolve_auth_header(config: RunnerConfig) -> str:
     if config.mobot_auth_header:
         return config.mobot_auth_header
     if config.mobot_auth_token:
+        if token_is_expired(config.mobot_auth_token):
+            if has_api_key_auth(config):
+                append_progress("provided Mobot auth token is expired; exchanging API key for a fresh token")
+                return f"Token {exchange_api_key(config)}"
+            raise RuntimeError(
+                "MOBOT_AUTH_TOKEN is expired; provide a fresh token or configure MOBOT_API_KEY_SECRET_ID"
+            )
         return f"Token {config.mobot_auth_token}"
     return f"Token {exchange_api_key(config)}"
 
@@ -180,6 +214,26 @@ def resolve_auth_header(config: RunnerConfig) -> str:
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{json.dumps(value, indent=2)}\n", encoding="utf-8")
+
+
+def configure_playwright_cli() -> None:
+    write_json(
+        PLAYWRIGHT_CONFIG_PATH,
+        {
+            "browser": {
+                "browserName": "chromium",
+                "launchOptions": {
+                    "channel": "chromium",
+                    "headless": True,
+                },
+            },
+            "timeouts": {
+                "action": 10000,
+                "navigation": 90000,
+            },
+        },
+    )
+    append_progress("configured Playwright CLI for Chromium")
 
 
 def append_progress(message: str, payload: dict[str, Any] | None = None) -> None:
@@ -447,6 +501,7 @@ def main() -> int:
     plan = load_test_plan(config)
     runner_prompt = load_runner_prompt(config)
     write_json(PLAN_PATH, plan)
+    configure_playwright_cli()
 
     try:
         auth_header = resolve_auth_header(config)

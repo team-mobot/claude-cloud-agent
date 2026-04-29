@@ -42,6 +42,8 @@ Auth resolution order:
 2. `MOBOT_AUTH_TOKEN` as `Token <value>`
 3. `MOBOT_API_KEY_SECRET_ID` / `MOBOT_API_KEY` exchanged through `/api/login/api-key/session`
 
+If `MOBOT_AUTH_TOKEN` is an expired JWT and API-key auth is configured, the runner exchanges the API key for a fresh token before starting Claude. Otherwise it publishes blocked results with a clear auth error.
+
 ## Deploy
 
 Build and push the updated agent image using the existing `claude-agent` image workflow:
