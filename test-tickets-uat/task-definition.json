@@ -71,6 +71,10 @@
         {
           "name": "CUSTOMER_DOCS_MEDIA_LOCAL_ROOT_PATH",
           "value": "/data/customer-docs-media"
+        },
+        {
+          "name": "VALKEY_URL",
+          "value": "rediss://master.mobot-agents-staging-valkey.nmj4ut.use1.cache.amazonaws.com:6379"
         }
       ],
       "secrets": [
