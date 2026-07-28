@@ -2,7 +2,7 @@
  * Development proxy server for UAT environment.
  *
  * Routes traffic between Vite dev server and Express API:
- * - /api/*, /auth/* -> Express (port 3002)
+ * - /api/*, /auth/*, /socket.io/* -> Express (port 3002)
  * - Everything else -> Vite (port 5173)
  *
  * Supports WebSocket proxying for Vite HMR.
@@ -29,7 +29,7 @@ proxy.on('error', (err, req, res) => {
 
 // Determine target based on URL path
 function getTarget(url) {
-  if (url.startsWith('/api/') || url.startsWith('/auth/')) {
+  if (url.startsWith('/api/') || url.startsWith('/auth/') || url.startsWith('/socket.io/')) {
     return `http://localhost:${EXPRESS_PORT}`;
   }
   return `http://localhost:${VITE_PORT}`;
