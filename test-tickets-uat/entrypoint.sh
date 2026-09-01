@@ -341,7 +341,7 @@ except Exception as e:
         --health-check-interval-seconds 30 \
         --healthy-threshold-count 2 \
         --query 'TargetGroups[0].TargetGroupArn' \
-        --output text 2>/dev/null)
+        --output text 2>/dev/null || true)
 
     if [ -z "$SESSION_TG_ARN" ] || [ "$SESSION_TG_ARN" = "None" ]; then
         # Target group might already exist, try to get it
