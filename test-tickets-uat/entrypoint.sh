@@ -348,7 +348,7 @@ except Exception as e:
         SESSION_TG_ARN=$(aws elbv2 describe-target-groups \
             --names "$SESSION_TG_NAME" \
             --query 'TargetGroups[0].TargetGroupArn' \
-            --output text 2>/dev/null)
+            --output text 2>/dev/null || true)
     fi
 
     if [ -n "$SESSION_TG_ARN" ] && [ "$SESSION_TG_ARN" != "None" ]; then
@@ -368,7 +368,7 @@ except Exception as e:
             EXISTING_PRIORITIES=$(aws elbv2 describe-rules \
                 --listener-arn "$ALB_LISTENER_ARN" \
                 --query 'Rules[*].Priority' \
-                --output text 2>/dev/null | tr '\t' '\n' | grep -v default | sort -n)
+                --output text 2>/dev/null | tr '\t' '\n' | grep -v default | sort -n || true)
 
             PRIORITY=10
             while echo "$EXISTING_PRIORITIES" | grep -q "^${PRIORITY}$"; do
@@ -382,7 +382,7 @@ except Exception as e:
                 --conditions "[{\"Field\":\"host-header\",\"Values\":[\"$SUBDOMAIN\"]}]" \
                 --actions "[{\"Type\":\"forward\",\"TargetGroupArn\":\"$SESSION_TG_ARN\"}]" \
                 --query 'Rules[0].RuleArn' \
-                --output text 2>/dev/null)
+                --output text 2>/dev/null || true)
 
             if [ -n "$RULE_ARN" ] && [ "$RULE_ARN" != "None" ]; then
                 echo "  ALB rule created: $RULE_ARN"
