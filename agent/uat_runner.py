@@ -526,5 +526,30 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as error:
-        print(f"UAT runner failed before publishing results: {error}", file=sys.stderr)
-        raise
+        # A preflight failure (for example a missing prompt or malformed runner
+        # configuration) used to exit before `main()` had a RunnerConfig, so no
+        # result object was uploaded. The workflow then reported every planned
+        # case as mysteriously blocked. Publish a best-effort diagnostic result
+        # whenever RESULTS_S3_URI is present, even if config loading failed.
+        message = f"UAT runner failed before normal result publishing: {error}"
+        print(message, file=sys.stderr)
+        try:
+            results_s3_uri = env("RESULTS_S3_URI")
+            if results_s3_uri:
+                target_url = env("TARGET_URL")
+                result = {
+                    "status": "error",
+                    "summary": message,
+                    "targetUrl": target_url,
+                    "cases": [],
+                }
+                WORK_DIR.mkdir(parents=True, exist_ok=True)
+                write_json(RESULTS_PATH, result)
+                upload_file(RESULTS_PATH, results_s3_uri)
+                artifacts_s3_uri = env("ARTIFACTS_S3_URI")
+                if artifacts_s3_uri:
+                    upload_directory(ARTIFACT_DIR, artifacts_s3_uri)
+                print(json.dumps({"status": "error", "resultsS3Uri": results_s3_uri}))
+        except Exception as publish_error:
+            print(f"UAT runner also failed to publish fallback result: {publish_error}", file=sys.stderr)
+        sys.exit(1)
