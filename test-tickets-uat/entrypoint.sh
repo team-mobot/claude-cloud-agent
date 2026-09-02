@@ -219,15 +219,51 @@ if (pkg.scripts && pkg.scripts.dev === 'vite') {
 }
 "
 
-echo "[2/9] Installing dependencies..."
-npm ci --include=dev 2>&1
+dependency_hash() {
+    local lockfile="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$lockfile" | awk '{print $1}'
+    else
+        sha256 -q "$lockfile"
+    fi
+}
 
-# Install server dependencies if separate package
+install_dependencies() {
+    local package_dir="$1"
+    local cache_dir="/opt/uat-dependency-cache/${package_dir:-root}"
+    local lockfile="${package_dir:+$package_dir/}package-lock.json"
+    local expected_hash=""
+    local actual_hash=""
+
+    if [ ! -f "$lockfile" ]; then
+        echo "  ERROR: required lockfile missing at $lockfile; refusing dependency installation" >&2
+        return 1
+    fi
+
+    actual_hash=$(dependency_hash "$lockfile")
+    if [ -f "$cache_dir/lockfile.sha256" ]; then
+        expected_hash=$(tr -d '[:space:]' < "$cache_dir/lockfile.sha256")
+    fi
+
+    if [ "$actual_hash" = "$expected_hash" ] && [ -d "$cache_dir/node_modules" ]; then
+        echo "  Reusing image dependency cache for ${package_dir:-root} (lockfile $actual_hash)"
+        rm -rf "${package_dir:+$package_dir/}node_modules"
+        cp -a "$cache_dir/node_modules" "${package_dir:-.}/node_modules"
+        return
+    fi
+
+    if [ -n "$expected_hash" ]; then
+        echo "  Lockfile changed for ${package_dir:-root}; installing branch dependencies"
+    else
+        echo "  No matching image cache for ${package_dir:-root}; installing branch dependencies"
+    fi
+    npm --prefix "${package_dir:-.}" ci --include=dev --cache /opt/uat-npm-cache --prefer-offline
+}
+
+echo "[2/9] Preparing dependencies..."
+install_dependencies ""
 if [ -f "server/package.json" ]; then
-    echo "  Installing server dependencies..."
-    cd server
-    npm ci --include=dev 2>&1
-    cd ..
+    install_dependencies "server"
 fi
 
 echo "[3/9] Preparing native Git repositories..."
@@ -341,14 +377,14 @@ except Exception as e:
         --health-check-interval-seconds 30 \
         --healthy-threshold-count 2 \
         --query 'TargetGroups[0].TargetGroupArn' \
-        --output text 2>/dev/null || true)
+        --output text || true)
 
     if [ -z "$SESSION_TG_ARN" ] || [ "$SESSION_TG_ARN" = "None" ]; then
         # Target group might already exist, try to get it
         SESSION_TG_ARN=$(aws elbv2 describe-target-groups \
             --names "$SESSION_TG_NAME" \
             --query 'TargetGroups[0].TargetGroupArn' \
-            --output text 2>/dev/null || true)
+            --output text || true)
     fi
 
     if [ -n "$SESSION_TG_ARN" ] && [ "$SESSION_TG_ARN" != "None" ]; then
@@ -382,7 +418,7 @@ except Exception as e:
                 --conditions "[{\"Field\":\"host-header\",\"Values\":[\"$SUBDOMAIN\"]}]" \
                 --actions "[{\"Type\":\"forward\",\"TargetGroupArn\":\"$SESSION_TG_ARN\"}]" \
                 --query 'Rules[0].RuleArn' \
-                --output text 2>/dev/null || true)
+                --output text || true)
 
             if [ -n "$RULE_ARN" ] && [ "$RULE_ARN" != "None" ]; then
                 echo "  ALB rule created: $RULE_ARN"
