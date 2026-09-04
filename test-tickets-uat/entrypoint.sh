@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+MIGRATE_ONLY=false
+if [ "$1" = "migrate" ]; then
+    MIGRATE_ONLY=true
+    shift
+fi
+
 echo "=== test_tickets UAT Container Starting ==="
 echo "  Branch: ${BRANCH:-main}"
 echo "  Session: ${SESSION_ID:-unknown}"
@@ -277,6 +283,11 @@ export CUSTOMER_DOCS_MEDIA_LOCAL_ROOT_PATH="${CUSTOMER_DOCS_MEDIA_LOCAL_ROOT_PAT
 clone_native_git_repo "${TEST_PLANS_GIT_REPO:-team-mobot/ai_driver_test_plans}" "$TEST_PLANS_GIT_REPO_PATH" "${TEST_PLANS_GIT_REMOTE_BRANCH:-main}"
 clone_native_git_repo "${CUSTOMER_DOCS_GIT_REPO:-team-mobot/customer-docs}" "$CUSTOMER_DOCS_GIT_REPO_PATH" "${CUSTOMER_DOCS_GIT_REMOTE_BRANCH:-main}"
 clear_github_token_git_rewrites
+
+if [ "$MIGRATE_ONLY" = true ]; then
+    echo "[4/4] Running database migrations..."
+    exec npm --prefix server run migrate
+fi
 
 # Set Vite env vars
 export VITE_GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}"
