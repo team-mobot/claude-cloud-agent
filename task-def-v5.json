@@ -27,7 +27,8 @@
         {"name": "ALB_LISTENER_ARN", "value": "arn:aws:elasticloadbalancing:us-east-1:678954237808:listener/app/test-tickets-uat-alb/7e47b6b368ee29e1/9b650b437fde8e6f"},
         {"name": "VPC_ID", "value": "vpc-0fde49947ce39aec4"},
         {"name": "UAT_DOMAIN_SUFFIX", "value": "uat.teammobot.dev"},
-        {"name": "REPO", "value": "team-mobot/test_tickets"}
+        {"name": "REPO", "value": "team-mobot/test_tickets"},
+        {"name": "DISABLE_ORPHAN_RECOVERY", "value": "true"}
       ],
       "secrets": [
         {
