@@ -17,8 +17,11 @@ RUN npm install -g tsx
 RUN npm install -g @anthropic-ai/claude-code
 
 # Use existing node user (uid 1000) and create workspace/native git repo roots
-RUN mkdir -p /app /data/repos /data/customer-docs-media && \
-    chown -R node:node /app /data
+# Runtime `npm ci` uses /opt/uat-npm-cache when a branch lockfile does not
+# match the prebuilt dependency layer. The container runs as the node user,
+# so that cache directory must exist and be writable before startup.
+RUN mkdir -p /app /data/repos /data/customer-docs-media /opt/uat-npm-cache && \
+    chown -R node:node /app /data /opt/uat-npm-cache
 
 WORKDIR /app
 
