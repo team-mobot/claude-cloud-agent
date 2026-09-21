@@ -25,8 +25,8 @@
           "value": "us-east-1"
         },
         {
-          "name": "CLAUDE_CODE_USE_BEDROCK",
-          "value": "1"
+          "name": "UAT_RUNNER_AZURE_RESPONSES_MODEL",
+          "value": "gpt-5.6-terra"
         }
       ],
       "logConfiguration": {
