@@ -6,14 +6,15 @@ FROM --platform=linux/amd64 python:3.11-slim
 RUN apt-get update && apt-get install -y \
     git \
     curl \
-    nodejs \
-    npm \
+    ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PLAYWRIGHT_BROWSERS_PATH="/ms-playwright"
 
-# Install Claude Code CLI and Playwright tooling for one-shot UAT runner tasks.
-RUN npm install -g @anthropic-ai/claude-code playwright @playwright/test @playwright/cli && \
+# Claude Code remains for development-agent sessions. Pi and Playwright power one-shot UAT runs.
+RUN npm install -g --ignore-scripts @anthropic-ai/claude-code @earendil-works/pi-coding-agent@0.86.1 playwright @playwright/test @playwright/cli && \
     npx playwright install --with-deps chromium && \
     playwright-cli install-browser chromium && \
     chmod -R a+rX /ms-playwright

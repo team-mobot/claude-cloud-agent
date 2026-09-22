@@ -19,8 +19,11 @@ ARTIFACT_DIR = WORK_DIR / "artifacts"
 RESULTS_PATH = WORK_DIR / "results.json"
 PLAN_PATH = WORK_DIR / "test-plan.json"
 PLAYWRIGHT_CONFIG_PATH = WORK_DIR / ".playwright" / "cli.config.json"
-CLAUDE_LOG_PATH = ARTIFACT_DIR / "claude-output.log"
+PI_LOG_PATH = ARTIFACT_DIR / "pi-output.log"
 PROGRESS_PATH = ARTIFACT_DIR / "progress.jsonl"
+PI_PROVIDER = "azure-openai-responses"
+DEFAULT_AZURE_RESPONSES_MODEL = "gpt-5.6-terra"
+PI_TOOLS = "bash,read,write,edit,grep,find,ls"
 
 
 @dataclass(frozen=True)
@@ -38,7 +41,9 @@ class RunnerConfig:
     test_plan_json: str = ""
     runner_prompt_s3_uri: str = ""
     runner_prompt: str = ""
-    claude_model: str = ""
+    azure_responses_endpoint: str = ""
+    azure_responses_api_key: str = ""
+    azure_responses_model: str = DEFAULT_AZURE_RESPONSES_MODEL
 
 
 def env(name: str, fallback: str = "") -> str:
@@ -67,7 +72,11 @@ def load_config() -> RunnerConfig:
         test_plan_json=env("TEST_PLAN_JSON"),
         runner_prompt_s3_uri=env("RUNNER_PROMPT_S3_URI"),
         runner_prompt=env("RUNNER_PROMPT"),
-        claude_model=env("CLAUDE_MODEL"),
+        azure_responses_endpoint=required_env("UAT_RUNNER_AZURE_RESPONSES_ENDPOINT"),
+        azure_responses_api_key=required_env("UAT_RUNNER_AZURE_RESPONSES_API_KEY"),
+        azure_responses_model=env(
+            "UAT_RUNNER_AZURE_RESPONSES_MODEL", DEFAULT_AZURE_RESPONSES_MODEL
+        ),
     )
 
 
@@ -318,29 +327,45 @@ def emit_text_progress(text: str) -> None:
             return
 
 
-def handle_claude_stream_line(line: str) -> None:
+def handle_pi_stream_line(line: str) -> None:
     stripped = line.strip()
     if not stripped:
         return
     try:
         event = json.loads(stripped)
     except json.JSONDecodeError:
-        append_progress(compact_text(stripped), {"source": "claude"})
+        append_progress(compact_text(stripped), {"source": "pi"})
         return
 
     event_type = event.get("type")
-    if event_type == "assistant":
-        for item in event.get("message", {}).get("content", []):
-            item_type = item.get("type")
-            if item_type == "text":
-                emit_text_progress(str(item.get("text") or ""))
-            elif item_type == "tool_use":
-                append_progress(summarize_tool_use(item), {"source": "tool_use"})
-    elif event_type == "result":
-        status = event.get("subtype") or event.get("result") or "completed"
-        append_progress(f"Claude result: {status}", {"source": "result"})
-    elif event_type == "system" and event.get("subtype"):
-        append_progress(f"Claude system: {event['subtype']}", {"source": "system"})
+    if event_type == "tool_execution_start":
+        append_progress(
+            summarize_tool_use(
+                {
+                    "name": event.get("toolName"),
+                    "input": event.get("args"),
+                }
+            ),
+            {"source": "tool_use"},
+        )
+    elif event_type == "tool_execution_end":
+        status = "failed" if event.get("isError") else "completed"
+        append_progress(
+            f"tool {event.get('toolName') or 'unknown'} {status}",
+            {"source": "tool_use"},
+        )
+    elif event_type == "message_update":
+        assistant_event = event.get("assistantMessageEvent")
+        if isinstance(assistant_event, dict) and assistant_event.get("type") == "text_delta":
+            emit_text_progress(str(assistant_event.get("delta") or ""))
+    elif event_type == "message_end":
+        message = event.get("message")
+        if isinstance(message, dict):
+            for item in message.get("content", []):
+                if isinstance(item, dict) and item.get("type") == "text":
+                    emit_text_progress(str(item.get("text") or ""))
+    elif event_type == "agent_end":
+        append_progress("Pi agent completed", {"source": "result"})
 
 
 def render_prompt_template(template: str, config: RunnerConfig, plan: dict[str, Any]) -> str:
@@ -364,31 +389,38 @@ def render_prompt_template(template: str, config: RunnerConfig, plan: dict[str, 
     return rendered.strip()
 
 
-def run_claude(config: RunnerConfig, plan: dict[str, Any], runner_prompt: str) -> int:
-    command = [
-        "claude",
-        "--dangerously-skip-permissions",
-        "--output-format",
-        "stream-json",
-        "--verbose",
+def build_pi_command(config: RunnerConfig, plan: dict[str, Any], runner_prompt: str) -> list[str]:
+    return [
+        "pi",
+        "--provider",
+        PI_PROVIDER,
+        "--model",
+        config.azure_responses_model,
+        "--mode",
+        "json",
+        "--no-session",
+        "--tools",
+        PI_TOOLS,
+        "--print",
+        render_prompt_template(runner_prompt, config, plan),
     ]
-    if config.claude_model:
-        command.extend(["--model", config.claude_model])
-    command.extend(["-p", render_prompt_template(runner_prompt, config, plan)])
 
+
+def run_pi(config: RunnerConfig, plan: dict[str, Any], runner_prompt: str) -> int:
     env_vars = os.environ.copy()
-    env_vars.setdefault("CLAUDE_CODE_USE_BEDROCK", "1")
-    env_vars.setdefault("NODE_PATH", "/usr/local/lib/node_modules")
-    if config.claude_model:
-        env_vars.setdefault("ANTHROPIC_MODEL", config.claude_model)
-        if "opus" in config.claude_model:
-            env_vars.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", config.claude_model)
+    # Pi uses these provider-native names. Keep the runner's Azure credentials
+    # distinct from any generic application or development-agent credentials.
+    env_vars["AZURE_OPENAI_BASE_URL"] = config.azure_responses_endpoint
+    env_vars["AZURE_OPENAI_API_KEY"] = config.azure_responses_api_key
+    env_vars.pop("CLAUDE_CODE_USE_BEDROCK", None)
+    env_vars.pop("ANTHROPIC_MODEL", None)
+    env_vars.pop("ANTHROPIC_DEFAULT_OPUS_MODEL", None)
 
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    append_progress("starting Claude Code")
-    with CLAUDE_LOG_PATH.open("w", encoding="utf-8") as log_file:
+    append_progress("starting Pi with Azure OpenAI Responses")
+    with PI_LOG_PATH.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
-            command,
+            build_pi_command(config, plan, runner_prompt),
             cwd=str(WORK_DIR),
             env=env_vars,
             stdout=subprocess.PIPE,
@@ -400,9 +432,9 @@ def run_claude(config: RunnerConfig, plan: dict[str, Any], runner_prompt: str) -
             for line in process.stdout:
                 log_file.write(line)
                 log_file.flush()
-                handle_claude_stream_line(line)
+                handle_pi_stream_line(line)
         return_code = process.wait()
-    append_progress(f"Claude Code exited with code {return_code}")
+    append_progress(f"Pi exited with code {return_code}")
     return return_code
 
 
@@ -425,12 +457,12 @@ def fallback_case_id(config: RunnerConfig, index: int) -> str:
 
 def normalize_results(config: RunnerConfig, plan: dict[str, Any]) -> dict[str, Any]:
     if not RESULTS_PATH.exists():
-        return fallback_results(config, plan, "Claude did not write results.json")
+        return fallback_results(config, plan, "UAT agent did not write results.json")
 
     try:
         results = json.loads(RESULTS_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        return fallback_results(config, plan, f"Claude wrote invalid results JSON: {exc}")
+        return fallback_results(config, plan, f"UAT agent wrote invalid results JSON: {exc}")
 
     cases = results.get("cases")
     if not isinstance(cases, list):
@@ -509,11 +541,11 @@ def main() -> int:
         if auth_header.startswith("Token "):
             os.environ["MOBOT_AUTH_TOKEN"] = auth_header.removeprefix("Token ")
 
-        claude_exit_code = run_claude(config, plan, runner_prompt)
+        pi_exit_code = run_pi(config, plan, runner_prompt)
         results = normalize_results(config, plan)
-        if claude_exit_code != 0 and results.get("status") == "passed":
+        if pi_exit_code != 0 and results.get("status") == "passed":
             results["status"] = "error"
-            results["summary"] = f"Claude exited with code {claude_exit_code} after writing results."
+            results["summary"] = f"Pi exited with code {pi_exit_code} after writing results."
     except Exception as error:
         results = fallback_results(config, plan, str(error))
 
